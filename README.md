@@ -4,6 +4,8 @@ emoji: 🤖
 colorFrom: blue
 colorTo: green
 sdk: docker
+sdk_version: "latest"
+python_version: "3.12"
 app_file: app.py
 pinned: false
 ---
@@ -177,7 +179,11 @@ pip install -r requirements.txt
 export API_BASE_URL="https://your-llm-endpoint/v1"
 export MODEL_NAME="your-model-name"
 export HF_TOKEN="your-api-key"
-export ENV_URL="http://localhost:7860"   # default; only change if server runs elsewhere
+# For local testing
+export ENV_URL="http://localhost:7860"
+
+# For Hugging Face deployment (used by evaluator)
+export ENV_URL="https://<your-space-name>.hf.space" # default; only change if server runs elsewhere
 ```
 
 ### Running
@@ -245,25 +251,37 @@ curl -s -X POST http://localhost:7860/reset \
 
 ## Project Structure
 
-```
-incidentiq/
-├── app.py                  # FastAPI server — exposes OpenEnv HTTP endpoints
-├── environment.py          # Core environment logic, state machine, reward shaping
-├── tasks/
-│   ├── single_service_outage.py
-│   ├── cascading_failure.py
-│   └── ambiguous_payment_degradation.py
-├── graders/                # Deterministic episode graders (0.0–1.0)
-├── models.py               # Pydantic models: IncidentObservation, Action, Reward
-├── inference.py            # Baseline inference script (OpenAI client)
-├── openenv.yaml            # OpenEnv metadata
-├── Dockerfile
-├── requirements.txt
-└── README.md
-```
+incident-response-env/
+├── server/                         # Core environment server (FastAPI + OpenEnv)
+│   ├── __init__.py
+│   ├── app.py                      # FastAPI app exposing /reset, /step, /state, /health
+│   ├── environment.py              # Main environment logic (step/reset/state, reward)
+│   ├── incidents.py                # Deterministic incident generator (seed-based)
+│   ├── simulator.py                # Dynamic simulation (logs + metrics evolution)
+│   ├── tasks.py                    # Task configs (difficulty, max_steps, rewards)
+│
+├── models.py                       # Pydantic models (Action, Observation, State)
+├── inference.py                    # Baseline agent (OpenAI-compatible client)
+├── client.py                       # Optional client helper for interacting with env
+│
+├── openenv.yaml                    # OpenEnv metadata (tasks, spaces, entrypoint)
+├── Dockerfile                      # Container setup for HF Spaces deployment
+├── pyproject.toml                  # Project config (used by uv)
+├── uv.lock                         # Dependency lock file (reproducible builds)
+├── requirements.txt                # Python dependencies (fallback install)
+│
+├── .env                            # Local environment variables (not committed)
+├── .env.example                    # Template for required env variables
+├── .gitignore                      # Ignore rules
+│
+├── validate-submission.sh          # Pre-submission validation script
+├── README.md                       # Project documentation
+│
+├── venv/ or .venv/                 # Virtual environment (local only, ignored)
+└── __pycache__/                    # Python cache (auto-generated)
 
 ---
-
+The inference script uses an OpenAI-compatible client interface configured via API_BASE_URL and MODEL_NAME.
 ## License
 
 MIT
