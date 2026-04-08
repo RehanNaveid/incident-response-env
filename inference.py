@@ -39,8 +39,8 @@ from server.tasks import TASK_CONFIGS
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_BASE_URL: str = os.environ.get("API_BASE_URL", "")
-MODEL_NAME: str = os.environ.get("MODEL_NAME", "")
+API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "openai/gpt-4o-mini")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860")
 
