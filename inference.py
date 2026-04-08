@@ -25,11 +25,15 @@ import json
 import os
 import sys
 from typing import Any, Dict, List, Tuple
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import requests
 from openai import OpenAI
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # env vars must be set directly in the environment
 # Ensure project root is importable so we can use server.tasks
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from server.tasks import TASK_CONFIGS

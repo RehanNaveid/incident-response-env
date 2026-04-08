@@ -12,8 +12,9 @@ RUN pip install --no-cache-dir uv
 COPY . .
 
 # Install dependencies from pyproject + uv.lock
-RUN uv sync
-
+RUN uv sync && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -e .
 # Expose port (HF uses dynamic PORT)
 EXPOSE 7860
 
