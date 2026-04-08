@@ -250,7 +250,7 @@ curl -s -X POST http://localhost:7860/reset \
 ---
 
 ## Project Structure
-
+```
 incident-response-env/
 ├── server/                         # Core environment server (FastAPI + OpenEnv)
 │   ├── __init__.py
@@ -279,8 +279,10 @@ incident-response-env/
 │
 ├── venv/ or .venv/                 # Virtual environment (local only, ignored)
 └── __pycache__/                    # Python cache (auto-generated)
+```
 
 ---
+
 The inference script uses an OpenAI-compatible client interface configured via API_BASE_URL and MODEL_NAME.
 ## License
 
