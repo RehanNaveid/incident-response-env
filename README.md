@@ -1,6 +1,11 @@
 ---
-title: ...
+title: IncidentIQ
+emoji: 🤖
+colorFrom: blue
+colorTo: green
 sdk: docker
+app_file: app.py
+pinned: false
 ---
 
 # IncidentIQ — SRE Incident Response Environment
