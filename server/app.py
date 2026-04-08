@@ -155,6 +155,14 @@ def list_tasks():
         ]
     })
 
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "service": "incident-response-env",
+        "health": "/health",
+        "docs": "/docs"
+    }
 
 @app.get("/health")
 def health():
