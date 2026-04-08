@@ -760,16 +760,16 @@ def main() -> None:
     total_steps = sum(r["steps"] for r in results)
     all_success = all(r["success"] for r in results)
 
-    print("", flush=True)
-    print("=" * 60, flush=True)
-    print(f"[SUMMARY] tasks={len(results)} avg_score={total_score:.4f} "
-          f"total_steps={total_steps} all_success={all_success}", flush=True)
-    for r in results:
-        filled = int(r["score"] * 20)
-        bar = "\u2588" * filled + "\u2591" * (20 - filled)
-        print(f"  {r['task_id']:<35} [{bar}] {r['score']:.4f} "
-              f"({r['steps']} steps)", flush=True)
-    print("=" * 60, flush=True)
+    # print("", flush=True)
+    # print("=" * 60, flush=True)
+    # print(f"[SUMMARY] tasks={len(results)} avg_score={total_score:.4f} "
+    #       f"total_steps={total_steps} all_success={all_success}", flush=True)
+    # for r in results:
+    #     filled = int(r["score"] * 20)
+    #     bar = "\u2588" * filled + "\u2591" * (20 - filled)
+    #     print(f"  {r['task_id']:<35} [{bar}] {r['score']:.4f} "
+    #           f"({r['steps']} steps)", flush=True)
+    # print("=" * 60, flush=True)
 
 
 if __name__ == "__main__":
