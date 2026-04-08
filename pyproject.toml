@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incident-response-env"
+version = "1.0.0"
+description = "An incident-response simulation environment for agentic RL, built on OpenEnv."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core>=0.2.1",
+    "pydantic>=2.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "requests>=2.25.0",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["server*"]
+
+[tool.setuptools]
+py-modules = ["models", "client", "inference"]
+
+[project.scripts]
+server = "server.app:main"

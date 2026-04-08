@@ -1,0 +1,20 @@
+name: incident_response_env
+version: "0.2.0"
+description: >
+  SRE incident response environment. An agent investigates production service
+  outages, identifies root causes from logs and metrics, and resolves incidents
+  under SLA constraints.
+tasks:
+  - id: single_service_outage
+    difficulty: easy
+    max_steps: 10
+  - id: cascading_failure
+    difficulty: medium
+    max_steps: 18
+  - id: ambiguous_payment_degradation
+    difficulty: hard
+    max_steps: 25
+action_space: text
+observation_space: structured
+reward_range: [0.0, 1.0]
+tags: [sre, incident-response, observability, real-world]
