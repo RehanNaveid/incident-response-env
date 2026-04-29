@@ -209,7 +209,7 @@ class IncidentResponseEnv(Environment):
 
         # Parse and store agent-reported belief for R2 trajectory grading
         parsed_belief = self._parse_belief_from_reasoning(action.reasoning or "")
-        step_brier_reward     = 0.0
+        step_r2_reward        = 0.0
         step_stability_reward = 0.0
         if parsed_belief:
             # Compute stability BEFORE appending (compares new vs previous)
@@ -219,11 +219,11 @@ class IncidentResponseEnv(Environment):
             else:
                 self._belief_trajectory.append(parsed_belief)
             self._last_reported_belief = parsed_belief
-            # Per-step Brier contribution toward R2
-            _rc   = self._incident_data.get("root_cause_service", "")
+            # Per-step cross-entropy contribution toward R2
+            _rc    = self._incident_data.get("root_cause_service", "")
             _cands = self._incident_data.get("fan_in_candidates", [])
             if _rc and _cands:
-                step_brier_reward = self._compute_step_brier(
+                step_r2_reward = self._compute_step_xent(
                     parsed_belief, _rc, _cands
                 )
         # If None: no belief this step — calibration rewards stay 0.0
@@ -311,10 +311,10 @@ class IncidentResponseEnv(Environment):
             severity_after=severity_after,
         )
 
-        # Calibration reward: R2 (Brier) + stability (KL penalty)
-        # step_brier_reward  in [0.0, 1.0] → scaled by R2_WEIGHT
+        # Calibration reward: R2 (cross-entropy) + stability (KL penalty)
+        # step_r2_reward in [0.0, 1.0] → scaled by R2_WEIGHT
         # step_stability_reward in [-0.10, 0.0] → applied directly
-        step_reward += R2_WEIGHT * step_brier_reward
+        step_reward += R2_WEIGHT * step_r2_reward
         step_reward += step_stability_reward
         step_reward  = max(-1.0, min(2.0, step_reward))
 
@@ -437,8 +437,8 @@ class IncidentResponseEnv(Environment):
             info["fan_in_dag"] = self._incident_data.get("fan_in_dag", {})
             # R2 calibration score over full belief trajectory
             info["r2_score"] = self._compute_r2_reward()
-            info["belief_brier_per_step"] = [
-                self._compute_step_brier(
+            info["belief_xent_per_step"] = [
+                self._compute_step_xent(
                     b,
                     self._incident_data.get("root_cause_service", ""),
                     self._incident_data.get("fan_in_candidates", []),
@@ -494,44 +494,57 @@ class IncidentResponseEnv(Environment):
             return None
 
     # ------------------------------------------------------------------
-    # R2 calibration reward — Brier-score belief trajectory grading
+    # R2 calibration reward — cross-entropy belief trajectory grading
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_step_brier(
+    def _compute_step_xent(
         belief: Dict[str, float],
         root: str,
         candidates: List[str],
     ) -> float:
-        """Brier score for one belief snapshot.
+        """Cross-entropy calibration reward for one belief snapshot.
 
-        Brier_t = 1 - (1/N) * Σ_i (p_i - y_i)^2
-        where y_i = 1.0 if service i is the true root, else 0.0.
-        N = number of candidates (normalises across incident sizes).
+        Implements: −Σ_s p(s) log p̂(s)  with one-hot ground truth p.
+        Since p(root) = 1.0 and p(other) = 0.0, this simplifies to:
 
-        Returns a value in [0.0, 1.0]; 1.0 = perfect calibration.
+            CE_t = −log(p̂_t(root))
+
+        Normalised by log(N) (N = |candidates|) so that:
+            p̂(root) = 1.0  →  reward = 1.0   (perfect)
+            p̂(root) = 1/N  →  reward = 0.0   (uniform, baseline)
+            p̂(root) < 1/N  →  reward = 0.0   (clamped; worse than uniform)
+
+        Returns a value in [0.0, 1.0].
         """
-        if not candidates:
-            return 0.0
-        brier_sum = 0.0
-        for c in candidates:
-            p = float(belief.get(c, 0.0))
-            y = 1.0 if c == root else 0.0
-            brier_sum += (p - y) ** 2
-        return max(0.0, 1.0 - brier_sum / len(candidates))
+        import math
+        N = len(candidates)
+        if N <= 1:
+            return 1.0   # trivially correct — no ambiguity to resolve
+        eps = 1e-9
+        p_root = max(float(belief.get(root, 0.0)), eps)
+        # Normalise: 1 + log(p_root)/log(N)
+        #   log(1.0)/log(N)  = 0    → reward = 1.0
+        #   log(1/N)/log(N)  = -1   → reward = 0.0
+        reward = 1.0 + math.log(p_root) / math.log(N)
+        return max(0.0, min(1.0, reward))
 
     def _compute_r2_reward(self) -> float:
-        """Time-weighted Brier-score calibration over the full belief trajectory.
-
-        Only active for cascading_failure (which exposes root_cause_service +
-        fan_in_candidates).  Returns 0.0 for other tasks or empty trajectories.
+        """Episode R2: cross-entropy calibration averaged over ALL episode steps.
 
         Formula:
-            R2 = final_brier * 0.6 + avg_brier * 0.4
+            R2 = (1/T) * Σ_{t=1}^{T} step_xent_t
 
-        The 60/40 split forces:
-          - Correct final answer  (convergence by episode end)
-          - Good trajectory       (consistent reasoning, not lucky last step)
+        where:
+            T              = self._step_count  (total episode steps)
+            step_xent_t    = _compute_step_xent(belief_t) if belief reported
+            step_xent_t    = 0.0               if no belief at step t
+
+        Zero-scoring missing steps (not dropping them) means the agent is
+        penalised for every step it fails to output a calibrated belief.
+
+        Only active for cascading_failure (has root_cause_service +
+        fan_in_candidates).  Returns 0.0 for other tasks or empty trajectories.
 
         Range: [0.0, 1.0]
         """
@@ -545,15 +558,17 @@ class IncidentResponseEnv(Environment):
         if not root or not candidates:
             return 0.0
 
-        brier_per_step = [
-            self._compute_step_brier(b, root, candidates)
-            for b in self._belief_trajectory
-        ]
-        avg_brier   = sum(brier_per_step) / len(brier_per_step)
-        final_brier = brier_per_step[-1]
+        total_steps = max(self._step_count, 1)   # avoid division by zero
 
-        r2 = final_brier * 0.6 + avg_brier * 0.4
-        return max(0.0, min(1.0, r2))
+        # Sum cross-entropy rewards for steps where belief was reported
+        # Missing steps contribute 0.0 implicitly (zero-score, no drop)
+        xent_sum = sum(
+            self._compute_step_xent(b, root, candidates)
+            for b in self._belief_trajectory
+        )
+
+        # Divide by TOTAL episode steps, not just len(belief_trajectory)
+        return max(0.0, min(1.0, xent_sum / total_steps))
 
     def _compute_stability_reward(self) -> float:
         """Symmetric KL-divergence penalty for oscillating belief.

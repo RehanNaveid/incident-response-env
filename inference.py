@@ -74,9 +74,12 @@ MAX_STEPS = {
     "ambiguous_payment_degradation": 25,
 }
 
-SIMULATOR_SCORE_WEIGHT = 0.4
-KEYWORD_SCORE_WEIGHT = 0.6
-USE_SIMULATOR_ONLY_SCORE = False
+# ---------------------------------------------------------------------------
+# Phase 2 scoring weights
+# ---------------------------------------------------------------------------
+
+R1_WEIGHT = 0.60   # Task accuracy — existing graders (grade_task1/2/3)
+R2_WEIGHT = 0.40   # Belief calibration — cross-entropy −Σ p(s) log p̂(s)
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) responding to a live production incident.
 
@@ -558,6 +561,23 @@ def _session_headers(session_id: str) -> Dict[str, str]:
     return {"X-Session-Id": session_id}
 
 
+def _fetch_episode_r2(session_headers: Dict[str, str]) -> float:
+    """Fetch R2 cross-entropy calibration score from /state after the episode.
+
+    Returns the server-computed r2_score in [0.0, 1.0].
+    Returns 0.0 on any network or parse error (safe default).
+    """
+    try:
+        resp = requests.get(
+            f"{ENV_URL}/state", headers=session_headers, timeout=10
+        )
+        resp.raise_for_status()
+        r2 = resp.json().get("info", {}).get("r2_score", 0.0)
+        return float(r2 or 0.0)
+    except Exception:
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Environment interaction helpers (HTTP)
 # ---------------------------------------------------------------------------
@@ -739,24 +759,34 @@ def run_task(task_id: str, client: OpenAI, seed: int = FIXED_SEED) -> Dict[str, 
             if done:
                 break
 
-        # ---- Grading ----
+        # ---- Grading (Phase 2: R1 * 0.60 + R2 * 0.40) ----
         task_config = TASK_CONFIGS.get(task_id, {})
         grader      = task_config.get("grader")
 
-        simulator_score = float(observation.get("score", 0.0) or 0.0)
-
         if grader:
-            keyword_score = grader(
+            # R1 — task accuracy from keyword / structural grader
+            r1_score = grader(
                 action_history, seed_meta, reasoning_texts=reasoning_texts
             )
-            if keyword_score < 0.5:
-                simulator_score *= 0.5
-            score = max(0.0, min(1.0,
-                SIMULATOR_SCORE_WEIGHT * simulator_score
-                + KEYWORD_SCORE_WEIGHT * keyword_score,
-            ))
+
+            # R2 — belief calibration: −Σ p(s) log p̂(s), fetched from /state
+            # Zero-scores steps where belief was missing (no rollout drop)
+            r2_score = _fetch_episode_r2(session_headers)
+            if not last_belief_dict:
+                # Agent never output a belief — R2 stays 0 (already is)
+                r2_score = 0.0
+
+            score = max(0.0, min(1.0, R1_WEIGHT * r1_score + R2_WEIGHT * r2_score))
+
+            print(
+                f"[GRADE] task={task_id} R1(task)={r1_score:.4f} "
+                f"R2(belief)={r2_score:.4f} "
+                f"score={score:.4f} "
+                f"beliefs_reported={len(reasoning_texts)}/{step_num}",
+                flush=True,
+            )
         else:
-            score = simulator_score
+            score = float(observation.get("score", 0.0) or 0.0)
 
         score   = max(0.0, min(score, 1.0))
         success = score >= 0.5
