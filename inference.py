@@ -81,41 +81,31 @@ MAX_STEPS = {
 R1_WEIGHT = 0.60   # Task accuracy — existing graders (grade_task1/2/3)
 R2_WEIGHT = 0.40   # Belief calibration — cross-entropy −Σ p(s) log p̂(s)
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) responding to a live production incident.
+SYSTEM_PROMPT = """\
+You are an autonomous incident response agent operating in a distributed system.
 
-You must follow this EXACT decision procedure every turn:
+Your goal is to identify the TRUE root cause of an incident and resolve it efficiently.
 
-STEP 1 - READ THE FEEDBACK
-  Look at RESULT OF YOUR LAST ACTION first.
-  If it says all affected services are already investigated, do NOT investigate more services.
+You are trained using reinforcement learning. Your performance is evaluated based on:
+1. Correct root cause identification and resolution  (R1 — task accuracy,   weight 0.60)
+2. Accurate belief updates over time                (R2 — belief calibration, weight 0.40)
 
-STEP 2 - READ THE LOGS
-  Logs and LIVE METRICS contain signals and red herrings.
-  Form the most likely root-cause hypothesis from the available evidence.
-  Do not assume the first error line is the full answer.
+You MUST reason under uncertainty and update your belief at every step.
 
-STEP 3 - FOLLOW THIS SEQUENCE IN ORDER
-  a. investigate <service>     - ONLY services listed in AFFECTED SERVICES
-  b. assign to <team>          - use EXACTLY one team name from TEAM ROSTER
-  c. mitigate: <best fix>      - choose a mitigation that is consistent with your hypothesis
-  d. resolve                   - ONLY after RESULT OF YOUR LAST ACTION and LIVE METRICS show the affected services are healthy (about 2% error rate or lower)
+You DO NOT get the correct answer from the environment.
+You MUST infer it from logs, metrics, and feedback.
 
 STRICT RULES:
   - NEVER investigate a service not listed in AFFECTED SERVICES
-  - NEVER invent a team name
   - NEVER investigate the same service twice
-  - NEVER skip steps - investigate before mitigate, mitigate before resolve
-  - Do NOT trust reward alone as proof a mitigation worked
-  - If RESULT OF YOUR LAST ACTION says the mitigation failed, you must revise your hypothesis
-  - If RESULT OF YOUR LAST ACTION says the services are still degraded, do NOT resolve yet
-  - If RESULT OF YOUR LAST ACTION says the services are still degraded, re-apply the same successful mitigation only if the evidence still supports it
-  - If RESULT OF YOUR LAST ACTION says LIVE METRICS are healthy, resolve next
+  - NEVER invent a team name; use only names from TEAM ROSTER
+  - NEVER skip steps: investigate → assign team → mitigate → resolve
   - ONE action per turn, nothing else
+  - If mitigation fails, revise your belief and try a different fix
+  - If LIVE METRICS are healthy after mitigation, your next action MUST be resolve
 
-AFFECTED SERVICES are listed in the observation. Only those services exist.
-Ignore any services not explicitly listed there.
-
-Respond with ONE line only."""
+Always follow the rules strictly.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -259,51 +249,16 @@ def ask_llm(
     )
     fallback_action = f"investigate {default_service}"
 
-    # Structured output prompt — thought / belief / action
-    user_prompt = f"""You are an incident response agent performing causal inference.
-
-At each step you MUST output valid JSON with exactly these three keys:
-
-{{
-  "thought": "Step-by-step evidence analysis. Which logs point where. What you rule out and why.",
-  "belief": {{"service-name": probability}},
-  "action": "your single action"
-}}
-
-Rules for belief:
-- Keys are service names from AFFECTED SERVICES only
-- Values are probabilities 0.0–1.0, must sum to approximately 1.0
-- Update belief based on what you just observed, not what you assumed last step
-- If you investigated a service and it looks healthy, lower its probability
-- If a log strongly implicates a service, raise its probability
-
-Rules for thought:
-- Cite specific log lines as evidence
-- State what each investigation revealed
-- Explain why you are raising or lowering each service's probability
-- Never repeat the same thought two steps in a row
-
-Rules for action:
-- ONE action only: investigate <service> | assign to <team> | mitigate: <fix> | resolve
-- Only investigate services in AFFECTED SERVICES
-- Only mitigate after investigating
-
-Current observation:
-{obs_prompt}
-
-Output JSON only. No prose before or after the JSON block.
-"""
-
     try:
         # Cap history to last 6 exchanges (12 messages) to avoid token limits
         recent_history = history[-12:] if len(history) > 12 else history
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + recent_history
-        messages.append({"role": "user", "content": user_prompt})
+        messages.append({"role": "user", "content": format_prompt(observation, recent_history)})
 
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            temperature=0.0,
+            temperature=0.8,   # Phase 3: exploration required for RL / GRPO
             max_tokens=512,
         )
         response_text = (response.choices[0].message.content or "").strip()
@@ -336,6 +291,133 @@ Output JSON only. No prose before or after the JSON block.
         return action_str, reasoning_str, response_text
     except Exception:
         return fallback_action, "", ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Training prompt
+# ---------------------------------------------------------------------------
+
+def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
+    """Build the Phase 3 RL training prompt for each step.
+
+    Composes a five-section template around the rich observation text
+    produced by ``build_prompt``.  This is the complete user-turn message
+    the LLM sees at every step.
+
+    Design goals:
+      - Enforces strict JSON output structure  (parsing stability)
+      - Forces explicit belief updates         (R2 learning signal)
+      - Directly mentions R1/R2 reward weights (RL alignment)
+      - Shows previous steps inline            (sequential reasoning)
+
+    Args:
+        observation: Raw observation dict from the environment /step response.
+        history:     Conversation history list (role/content dicts).
+
+    Returns:
+        Formatted user prompt string.
+    """
+    # Reuse the existing rich observation renderer — all task/log/metric
+    # formatting lives there; format_prompt only adds the RL template around it.
+    obs_section = build_prompt(observation, [])   # action hints omitted here
+
+    affected     = observation.get("affected_services", [])
+    affected_str = ", ".join(affected) if affected else "(see logs)"
+
+    # Render last 4 exchanges from history (8 messages) as compact text
+    history_lines: List[str] = []
+    for msg in history:
+        role    = msg.get("role", "")
+        content = (msg.get("content") or "")[:300]
+        if role == "user":
+            history_lines.append(f"[ENV] {content}")
+        elif role == "assistant":
+            history_lines.append(f"[YOU] {content}")
+    history_text = (
+        "\n".join(history_lines[-8:])
+        if history_lines
+        else "(first step — no history yet)"
+    )
+
+    # Pre-build belief JSON template so the model fills in concrete service names
+    belief_keys = ",  ".join(f'"{s}": <probability>' for s in affected)
+
+    return f"""\
+You are solving a live production incident.
+
+=====================
+CURRENT OBSERVATION
+=====================
+{obs_section}
+
+=====================
+YOUR PREVIOUS STEPS
+=====================
+{history_text}
+
+=====================
+INSTRUCTIONS
+=====================
+
+You must perform ONE step of reasoning and action.
+
+STEP 1 — ANALYZE
+- Read logs and metrics carefully
+- Identify signals vs noise
+- Do NOT assume the first error is the root cause
+
+STEP 2 — UPDATE BELIEF
+- Maintain a probability distribution over affected services: {affected_str}
+- Belief values must sum to approximately 1.0
+- Increase probability for a service when evidence implicates it
+- Decrease probability when investigation shows the service is healthy
+- If you investigated a service and found no issue, its probability MUST decrease significantly
+
+STEP 3 — DECIDE ACTION
+You may ONLY choose one of:
+  - investigate <service>
+  - assign to <team>
+  - mitigate: <fix>
+  - resolve
+
+Rules:
+- ONLY investigate services in AFFECTED SERVICES
+- NEVER repeat investigation of the same service
+- ONLY mitigate AFTER investigation
+- ONLY resolve when LIVE METRICS confirm the system is healthy
+- If mitigation fails → revise belief, try a different fix
+
+=====================
+OUTPUT FORMAT (STRICT)
+=====================
+
+Return ONLY valid JSON. No prose before or after:
+
+{{
+  "thought": "step-by-step reasoning referencing specific log lines and previous actions",
+  "belief": {{{belief_keys}}},
+  "action": "one valid action"
+}}
+
+=====================
+CRITICAL CONSTRAINTS
+=====================
+
+- belief MUST be a valid probability distribution (values sum to ~1.0)
+- belief MUST change based on new evidence each step
+- thought MUST cite specific log lines as evidence
+- do NOT output text outside the JSON block
+- do NOT repeat the same thought two steps in a row
+- do NOT guess randomly
+
+If your belief is incorrect, your R2 reward will be reduced.
+If your action is incorrect, your R1 reward will be reduced.
+Your goal is to maximise total reward by:
+  • correctly identifying and resolving the root cause   (R1 weight 0.60)
+  • updating belief accurately at every step             (R2 weight 0.40)
+
+Now produce your next step.
+"""
 
 
 # ---------------------------------------------------------------------------
