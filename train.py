@@ -113,6 +113,7 @@ class StepRecord:
     action:     str
     reasoning:  str
     reward:     float = 0.0
+    parse_ok:   bool  = True    # True if JSON parsed cleanly; False if fallback used
 
 
 @dataclass
@@ -123,6 +124,7 @@ class Episode:
     cumulative_reward: float = 0.0
     r2_score:          float = 0.0
     done:              bool  = False
+    parse_rate:        float = 1.0   # fraction of steps with valid JSON output
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +226,14 @@ def get_state() -> Dict[str, Any]:
 # 4.  Robust JSON parsing  (model output may be messy early in training)
 # ---------------------------------------------------------------------------
 
-def parse_output(raw: str, affected: List[str]) -> Tuple[str, str, Dict[str, float]]:
-    """Extract (action, reasoning, belief) from raw model output.
+def parse_output(
+    raw: str,
+    affected: List[str],
+) -> Tuple[str, str, Dict[str, float], bool]:
+    """Extract (action, reasoning, belief, parse_ok) from raw model output.
+
+    Returns parse_ok=True when JSON was valid, False when fallback was used.
+    Callers track parse_ok to compute per-step/per-episode parse success rates.
 
     Falls back to:  investigate first_service / uniform belief / empty thought.
     """
@@ -250,7 +258,7 @@ def parse_output(raw: str, affected: List[str]) -> Tuple[str, str, Dict[str, flo
                 pass
 
     if not parsed:
-        return fallback, "", uniform
+        return fallback, "", uniform, False      # parse_ok=False
 
     thought = str(parsed.get("thought", "")).strip()
     action  = str(parsed.get("action",  "")).strip() or fallback
@@ -263,7 +271,7 @@ def parse_output(raw: str, affected: List[str]) -> Tuple[str, str, Dict[str, flo
                   if isinstance(v, (int, float))}
 
     reasoning = f"Thought: {thought}\nBelief: {json.dumps(belief)}"
-    return action, reasoning, belief
+    return action, reasoning, belief, True        # parse_ok=True
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +283,7 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
 
     Uses local generate() — no external API.
     Reward comes exclusively from the environment (/step + /state).
+    parse_rate in the returned Episode = fraction of steps with valid JSON.
     """
     ep = Episode(task_id=task, seed=seed)
     try:
@@ -283,7 +292,9 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
         print(f"  [EP] reset failed: {e}")
         return ep
 
-    history: List[Dict] = []
+    history:   List[Dict] = []
+    parse_hits: int       = 0
+    parse_total: int      = 0
 
     for step_num in range(1, MAX_STEPS_EP + 1):
         prompt = format_prompt(obs, history)
@@ -295,7 +306,10 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
             break
 
         affected = obs.get("affected_services", [])
-        action, reasoning, _ = parse_output(raw, affected)
+        action, reasoning, _, parse_ok = parse_output(raw, affected)
+        parse_total += 1
+        if parse_ok:
+            parse_hits += 1
 
         try:
             next_obs, reward, done = step_env(action, reasoning)
@@ -305,7 +319,8 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
 
         ep.steps.append(StepRecord(
             prompt=prompt, completion=raw,
-            action=action, reasoning=reasoning, reward=reward,
+            action=action, reasoning=reasoning,
+            reward=reward, parse_ok=parse_ok,
         ))
         history += [
             {"role": "user",      "content": prompt},
@@ -316,6 +331,9 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
         if done:
             ep.done = True
             break
+
+    # Compute per-episode parse rate
+    ep.parse_rate = parse_hits / max(parse_total, 1)
 
     # Final state from environment (R1 + R2 already computed server-side)
     try:
@@ -417,6 +435,11 @@ def save_ckpt(model, tokenizer, step: int) -> None:
 # 8.  Training loop  (curriculum + GRPO update per step)
 # ---------------------------------------------------------------------------
 
+# Thresholds for training stability guards
+_MIN_PARSE_RATE:     float = 0.70   # stop training if parse rate falls below this
+_MIN_REWARD_STD:     float = 0.05   # warn if reward std below this (GRPO dead zone)
+
+
 def trainer_step(model, tokenizer, optimizer,
                  task: str, seed_base: int, global_step: int) -> Dict[str, float]:
     """One GRPO training step.
@@ -427,6 +450,10 @@ def trainer_step(model, tokenizer, optimizer,
     4. Switch to training mode
     5. Backprop policy-gradient loss
     6. Return metrics dict
+
+    Safety guards:
+      - Halts training if parse_rate < _MIN_PARSE_RATE (belief never updates)
+      - Warns if reward std < _MIN_REWARD_STD (GRPO has no signal)
     """
     # ---- Rollouts ----
     FastLanguageModel.for_inference(model)
@@ -436,14 +463,34 @@ def trainer_step(model, tokenizer, optimizer,
         episodes.append(ep)
         print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
               f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
-              f"steps={len(ep.steps)}  done={ep.done}")
+              f"steps={len(ep.steps)}  done={ep.done}  "
+              f"parse={ep.parse_rate:.0%}")
 
-    # ---- Advantages ----
+    # ---- Parse-rate guard ----
+    avg_parse = sum(ep.parse_rate for ep in episodes) / max(len(episodes), 1)
+    if avg_parse < _MIN_PARSE_RATE:
+        raise RuntimeError(
+            f"[TRAIN] HALT: parse_rate={avg_parse:.1%} < threshold {_MIN_PARSE_RATE:.0%}.\n"
+            f"  Model is producing garbage JSON. Possible causes:\n"
+            f"  - TEMPERATURE too high (try 0.7)\n"
+            f"  - prompt format mismatch\n"
+            f"  - model not following instruction format yet (wait 50+ steps)\n"
+            f"  Run dry_run() to diagnose without updating weights."
+        )
+
+    # ---- Advantages + reward-variance guard ----
+    rewards   = [ep.cumulative_reward for ep in episodes]
     advantages = grpo_advantages(episodes)
-    avg_r  = sum(ep.cumulative_reward for ep in episodes) / max(len(episodes), 1)
-    avg_r2 = sum(ep.r2_score          for ep in episodes) / max(len(episodes), 1)
-    best   = max(episodes, key=lambda e: e.cumulative_reward)
-    sample = best.steps[-1].action if best.steps else "N/A"
+    avg_r   = sum(rewards) / max(len(rewards), 1)
+    avg_r2  = sum(ep.r2_score for ep in episodes) / max(len(episodes), 1)
+    std_r   = math.sqrt(sum((r - avg_r) ** 2 for r in rewards) / max(len(rewards), 1))
+    best    = max(episodes, key=lambda e: e.cumulative_reward)
+    sample  = best.steps[-1].action if best.steps else "N/A"
+
+    if std_r < _MIN_REWARD_STD:
+        print(f"[WARN] Low reward variance std={std_r:.4f} < {_MIN_REWARD_STD} — "
+              f"GRPO signal is weak. Rewards: {[f'{r:.3f}' for r in rewards]}. "
+              f"Consider more diverse seeds or checking env reward range.")
 
     # ---- Update ----
     FastLanguageModel.for_training(model)
@@ -454,10 +501,12 @@ def trainer_step(model, tokenizer, optimizer,
     optimizer.step()
 
     return {
-        "loss":       loss.item(),
-        "avg_reward": avg_r,
-        "avg_r2":     avg_r2,
-        "sample":     sample,
+        "loss":        loss.item(),
+        "avg_reward":  avg_r,
+        "avg_r2":      avg_r2,
+        "reward_std":  std_r,
+        "parse_rate":  avg_parse,
+        "sample":      sample,
     }
 
 
@@ -481,11 +530,16 @@ def train(model, tokenizer) -> None:
                                    task, seed_base, global_step)
             elapsed = time.time() - t0
 
-            print(f"[TRAIN] loss={metrics['loss']:.6f}  "
-                  f"avg_reward={metrics['avg_reward']:.4f}  "
-                  f"avg_r2={metrics['avg_r2']:.4f}  "
-                  f"sample_action={metrics['sample']!r}  "
-                  f"elapsed={elapsed:.1f}s")
+            print(
+                f"[TRAIN] "
+                f"loss={metrics['loss']:.6f}  "
+                f"avg_reward={metrics['avg_reward']:.4f}  "
+                f"avg_r2={metrics['avg_r2']:.4f}  "
+                f"reward_std={metrics['reward_std']:.4f}  "
+                f"parse_rate={metrics['parse_rate']:.0%}  "
+                f"sample_action={metrics['sample']!r}  "
+                f"elapsed={elapsed:.1f}s"
+            )
 
             if global_step % SAVE_STEPS == 0:
                 save_ckpt(model, tokenizer, global_step)
@@ -495,6 +549,73 @@ def train(model, tokenizer) -> None:
     model.save_pretrained(FINAL_DIR)
     tokenizer.save_pretrained(FINAL_DIR)
     print(f"[TRAIN] Done. Model at ./{FINAL_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# 9.  Dry-run  — diagnostics WITHOUT weight updates
+# ---------------------------------------------------------------------------
+
+def dry_run(model, tokenizer, n: int = 10) -> None:
+    """Run N episodes with no weight updates; print diagnostic report.
+
+    Verifies before committing to training:
+      - parse_rate >= 70%  (model follows JSON format)
+      - reward std >= 0.05 (env produces varied signal for GRPO)
+      - R2 varies across episodes (belief calibration is active)
+
+    Call from main() or standalone:
+        model, tok = load_model()
+        dry_run(model, tok, n=10)
+    """
+    print(f"\n[DRY-RUN] Running {n} diagnostic episodes (no weight update) …")
+    FastLanguageModel.for_inference(model)
+
+    tasks  = CURRICULUM[-1]    # use full task pool for worst-case coverage
+    rows:  List[Dict] = []
+
+    for i in range(n):
+        task = tasks[i % len(tasks)]
+        seed = SEEDS[i % len(SEEDS)] + 1000   # distinct from training seeds
+        ep   = run_episode(model, tokenizer, task, seed)
+        rows.append({
+            "ep":     i + 1,
+            "task":   task[:20],
+            "reward": ep.cumulative_reward,
+            "r2":     ep.r2_score,
+            "parse":  ep.parse_rate,
+            "steps":  len(ep.steps),
+            "done":   ep.done,
+        })
+        print(f"  ep={i+1:02d}  task={task[:22]:<24}  "
+              f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
+              f"parse={ep.parse_rate:.0%}  steps={len(ep.steps)}")
+
+    # ---- Aggregate diagnostics ----
+    rewards     = [r["reward"] for r in rows]
+    parse_rates = [r["parse"]  for r in rows]
+    r2_scores   = [r["r2"]     for r in rows]
+
+    avg_r    = sum(rewards)     / max(len(rewards),     1)
+    avg_p    = sum(parse_rates) / max(len(parse_rates), 1)
+    avg_r2   = sum(r2_scores)   / max(len(r2_scores),   1)
+    std_r    = math.sqrt(sum((r - avg_r) ** 2 for r in rewards) / max(len(rewards), 1))
+
+    print("\n[DRY-RUN] ─── Diagnostic Summary ───────────────────────────────")
+    print(f"  Episodes         : {n}")
+    print(f"  avg_reward       : {avg_r:.4f}")
+    print(f"  reward_std       : {std_r:.4f}  {'✓ OK' if std_r >= _MIN_REWARD_STD else '✗ LOW — GRPO will be weak'}")
+    print(f"  avg_parse_rate   : {avg_p:.1%}  {'✓ OK' if avg_p >= _MIN_PARSE_RATE else '✗ LOW — R2 cannot learn'}")
+    print(f"  avg_r2           : {avg_r2:.4f}")
+    print("[DRY-RUN] ────────────────────────────────────────────────────────")
+
+    if avg_p < _MIN_PARSE_RATE:
+        print("[DRY-RUN] ✗ ABORT: parse_rate below threshold. "
+              "Fix prompt/JSON format before training.")
+    elif std_r < _MIN_REWARD_STD:
+        print("[DRY-RUN] ⚠ WARNING: reward variance is low. "
+              "GRPO can still run but convergence will be slow.")
+    else:
+        print("[DRY-RUN] ✓ READY: system looks healthy. Proceed to train().")
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +636,13 @@ def main() -> None:
           f"every {SAVE_STEPS} steps  keep {SAVE_TOTAL}")
 
     model, tokenizer = load_model()
+
+    # Step 1: diagnostic dry-run (10 episodes, no weight update)
+    # Aborts if parse_rate < 70% or prints variance warning.
+    # Remove or set n=0 to skip once you trust the setup.
+    dry_run(model, tokenizer, n=10)
+
+    # Step 2: full curriculum training
     train(model, tokenizer)
 
 
