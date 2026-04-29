@@ -18,7 +18,7 @@ Design rules:
 
 import random
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -143,12 +143,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Cascading failure after gateway config rollout",
         "severity": "P0",
         "affected_services": ["api-gateway", "user-service", "db-replica"],
-        "root_cause_service": "api-gateway",
+        "fan_in_candidates": ["api-gateway", "auth-service", "db-primary"],
+        "red_herring_services": ["user-service"],
         "correct_team": "platform",
         "team_map": {
             "api-gateway": "platform",
             "user-service": "backend",
             "db-replica": "database",
+            "auth-service": "backend",
+            "db-primary": "database",
         },
         "valid_mitigations": ["rollback", "revert", "feature flag", "disable"],
     },
@@ -157,12 +160,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Authentication rollout cascading across user traffic",
         "severity": "P0",
         "affected_services": ["auth-service", "api-gateway", "user-service"],
-        "root_cause_service": "auth-service",
+        "fan_in_candidates": ["auth-service", "db-primary", "cache-cluster"],
+        "red_herring_services": ["user-service"],
         "correct_team": "backend",
         "team_map": {
             "auth-service": "backend",
             "api-gateway": "platform",
             "user-service": "backend",
+            "db-primary": "database",
+            "cache-cluster": "backend",
         },
         "valid_mitigations": ["rollback", "revert", "config", "disable"],
     },
@@ -171,12 +177,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Database saturation cascading into read and payment failures",
         "severity": "P0",
         "affected_services": ["db-primary", "db-replica", "payment-service"],
-        "root_cause_service": "db-primary",
+        "fan_in_candidates": ["db-primary", "auth-service", "cache-cluster"],
+        "red_herring_services": ["user-service"],
         "correct_team": "database",
         "team_map": {
             "db-primary": "database",
             "db-replica": "database",
             "payment-service": "payments-oncall",
+            "auth-service": "backend",
+            "cache-cluster": "backend",
         },
         "valid_mitigations": ["scale", "connections", "pool", "kill query"],
     },
@@ -185,12 +194,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Rate-limit cascade across payment processing",
         "severity": "P0",
         "affected_services": ["payment-service", "queue-worker", "api-gateway"],
-        "root_cause_service": "payment-service",
+        "fan_in_candidates": ["payment-service", "auth-service", "cache-cluster"],
+        "red_herring_services": ["user-service"],
         "correct_team": "payments-oncall",
         "team_map": {
             "payment-service": "payments-oncall",
             "queue-worker": "payments-oncall",
             "api-gateway": "platform",
+            "auth-service": "backend",
+            "cache-cluster": "backend",
         },
         "valid_mitigations": ["throttle", "backoff", "rate limit", "batch"],
     },
@@ -199,12 +211,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Search index corruption causing downstream failures",
         "severity": "P1",
         "affected_services": ["search-service", "recommendation-service", "api-gateway"],
-        "root_cause_service": "search-service",
+        "fan_in_candidates": ["search-service", "db-primary", "cache-cluster"],
+        "red_herring_services": ["user-service"],
         "correct_team": "search",
         "team_map": {
             "search-service": "search",
             "recommendation-service": "search",
             "api-gateway": "platform",
+            "db-primary": "database",
+            "cache-cluster": "backend",
         },
         "valid_mitigations": ["rebuild", "index", "purge", "cache"],
     },
@@ -213,12 +228,15 @@ _CASCADE_BLUEPRINTS: List[Dict[str, Any]] = [
         "title": "Canary regression cascading into checkout failures",
         "severity": "P0",
         "affected_services": ["inventory-service", "checkout-service", "api-gateway"],
-        "root_cause_service": "inventory-service",
+        "fan_in_candidates": ["inventory-service", "auth-service", "db-primary"],
+        "red_herring_services": ["user-service"],
         "correct_team": "backend",
         "team_map": {
             "inventory-service": "backend",
             "checkout-service": "backend",
             "api-gateway": "platform",
+            "auth-service": "backend",
+            "db-primary": "database",
         },
         "valid_mitigations": ["rollback", "revert", "restart", "pods"],
     },
@@ -325,6 +343,9 @@ def _single_service_logs(
             *retry_logs,
             f"WARN  {service}: ConnectionTimeoutError timeout={timeout_ms}ms",
             f"WARN  api-gateway: upstream {service} timeout after 30s",
+            # distractors
+            "WARN  api-gateway: upstream connection timeout — root unclear",
+            "WARN  db-primary: replica lag 2s — unrelated to auth but looks suspicious",
         ]
     elif kind == "feature_flag":
         deploy_id = f"deploy-{rng.randint(1000, 9999)}"
@@ -340,6 +361,9 @@ def _single_service_logs(
             f"ERROR {service}: FeatureFlagError flag={flag_name} error_rate={error_rate}%",
             f"CRIT  {service}: rollback required for feature flag {flag_name}",
             "WARN  auth-service: downstream token verification requests failing",
+            # distractors
+            "WARN  db-primary: connection pool pressure — may be related",
+            "INFO  load-balancer: upstream health check marginal — investigating",
         ]
     elif kind == "memory_leak":
         deploy_id = f"deploy-{rng.randint(1000, 9999)}"
@@ -350,6 +374,9 @@ def _single_service_logs(
             f"ERROR {service}: OOMKilled after {deploy_id}",
             f"INFO  k8s: pod {service}-{rng.randint(100, 999)} restarted count={restart_count}",
             f"WARN  deploy-bot: rollback recommended for {service} memory regression",
+            # distractors
+            "WARN  api-gateway: upstream latency spike — origin unclear",
+            "WARN  db-primary: slow query log — possible connection spike",
         ]
     elif kind == "db_saturation":
         connections = rng.randint(940, 1000)
@@ -360,6 +387,9 @@ def _single_service_logs(
             f"WARN  {service}: pool waiters={waiting} - scale connections or kill query",
             f"INFO  {service}: long-running query pid={pid} blocking checkout writes",
             "WARN  api-gateway: upstream requests timing out on primary reads",
+            # distractors
+            "WARN  auth-service: session lookup latency elevated — possibly db",
+            "WARN  cache-cluster: eviction rate elevated — checking db offload",
         ]
     elif kind == "index_corruption":
         shard = rng.randint(1, 24)
@@ -369,6 +399,9 @@ def _single_service_logs(
             f"WARN  indexer: purge cache and rebuild index for {service}",
             f"INFO  indexer: last successful segment merge documents={documents}",
             "WARN  api-gateway: downstream search timeout budget exhausted",
+            # distractors
+            "WARN  db-primary: read replica lag 3s — possibly related",
+            "WARN  cache-cluster: cache miss rate elevated — investigating",
         ]
     else:
         deploy_id = f"deploy-{rng.randint(1000, 9999)}"
@@ -379,6 +412,9 @@ def _single_service_logs(
             f"ERROR {service}: canary regression detected after {deploy_id}",
             f"CRIT  {service}: rollback or disable canary {canary} immediately",
             f"INFO  k8s: restarted {service}-{rng.randint(100, 999)} count={restart_count}",
+            # distractors
+            "WARN  auth-service: token validation latency up — canary related?",
+            "WARN  api-gateway: upstream error budget burning — unclear origin",
         ]
 
     return _stamp_logs(logs, base_epoch)
@@ -424,16 +460,140 @@ def _generate_single_service_outage(
 # Task 2 — cascading_failure
 # -------------------------------------------------------------------
 
+
+def build_fan_in_dag(
+    blueprint: Dict[str, Any],
+    rng: random.Random,
+    root: str,
+) -> Dict[str, Any]:
+    """Build a two-layer causal fan-in DAG for a cascading_failure incident.
+
+    Layer 1 — Physical: uses the static DOWNSTREAM topology from simulator.py
+    as the ground-truth propagation graph.
+
+    Layer 2 — Causal: per-incident observable sub-graph derived from the
+    physical layer with controlled noise:
+        - 10–20 % of true causal edges are DROPPED   (partial observability)
+        - 20–30 % spurious edges are INJECTED         (red-herring noise)
+
+    This forces the agent to reason from observable evidence rather than
+    performing simple graph traversal on the known topology.
+
+    Args:
+        blueprint:  The selected cascade blueprint dict.
+        rng:        Seeded RNG — all draws come from here so output is
+                    deterministic for a given incident seed.
+        root:       The true root-cause service chosen by the caller.
+
+    Returns a dict with:
+        nodes           — all service names in the DAG
+        edges           — observable edges (true minus dropped, plus spurious)
+        root            — true root cause
+        true_edges      — ground-truth causal edges (never sent to agent)
+        spurious_edges  — injected noise edges
+        missing_edges   — dropped true edges (partial observability)
+    """
+    # Lazy import avoids circular dependency at module load time
+    from server.simulator import DOWNSTREAM
+
+    candidates: List[str] = blueprint.get("fan_in_candidates", [root])
+    affected:   List[str] = blueprint.get("affected_services", [])
+
+    # Node set: root + all candidates + all affected services (dedup, ordered)
+    nodes: List[str] = list(dict.fromkeys([root] + candidates + affected))
+
+    # ----------------------------------------------------------------
+    # True causal edges — BFS from root through DOWNSTREAM topology
+    # ----------------------------------------------------------------
+    true_edges: List[Tuple[str, str]] = []
+    visited: set = set()
+    queue: List[str] = [root]
+
+    while queue:
+        node = queue.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        for downstream_svc in DOWNSTREAM.get(node, []):
+            if downstream_svc in nodes:
+                edge = (node, downstream_svc)
+                if edge not in true_edges:
+                    true_edges.append(edge)
+                queue.append(downstream_svc)
+
+    # Peer-pressure edges: candidates that share DOWNSTREAM targets
+    for candidate in candidates:
+        if candidate == root:
+            continue
+        for downstream_svc in DOWNSTREAM.get(candidate, []):
+            if downstream_svc in nodes:
+                edge = (candidate, downstream_svc)
+                if edge not in true_edges:
+                    true_edges.append(edge)
+
+    # ----------------------------------------------------------------
+    # Drop 10–20 % of true edges  (partial observability)
+    # ----------------------------------------------------------------
+    n_remove = max(1, int(len(true_edges) * rng.uniform(0.10, 0.20)))
+    removable = list(true_edges)          # copy so we don't mutate
+    rng.shuffle(removable)
+    missing_edges: List[Tuple[str, str]] = removable[:n_remove]
+    missing_set = set(missing_edges)
+    observable_true = [e for e in true_edges if e not in missing_set]
+
+    # ----------------------------------------------------------------
+    # Inject 20–30 % spurious edges  (noise / red herrings)
+    # ----------------------------------------------------------------
+    existing_set = set(true_edges)
+    all_possible: List[Tuple[str, str]] = [
+        (a, b)
+        for a in nodes
+        for b in nodes
+        if a != b and (a, b) not in existing_set
+    ]
+    n_spurious = max(1, int(len(true_edges) * rng.uniform(0.20, 0.30)))
+    rng.shuffle(all_possible)
+    spurious_edges: List[Tuple[str, str]] = all_possible[:n_spurious]
+
+    return {
+        "nodes":          nodes,
+        "edges":          observable_true + spurious_edges,   # agent-visible
+        "root":           root,
+        "true_edges":     true_edges,          # ground truth — never exposed to agent
+        "spurious_edges": spurious_edges,
+        "missing_edges":  missing_edges,
+    }
+
+
 def _cascade_logs(
     blueprint: Dict[str, Any],
     base_epoch: int,
     rng: random.Random,
+    actual_root: str = None,
 ) -> tuple[List[str], Dict[str, Any]]:
-    """Build task 2 logs for the selected cascading-failure scenario."""
+    """Build task 2 logs for the selected cascading-failure scenario.
+
+    *actual_root* is the fan-in winner chosen by the caller.  The other
+    candidates get 1-2 weak distractor logs; red-herring services get error
+    logs that look alarming but are unrelated to the core failure.
+    """
     kind = blueprint["kind"]
     affected = blueprint["affected_services"]
-    root = blueprint["root_cause_service"]
+    # Fall back gracefully if called without actual_root
+    root = actual_root if actual_root else blueprint.get("fan_in_candidates", ["unknown"])[0]
 
+    candidates = blueprint.get("fan_in_candidates", [root])
+    distractors = [c for c in candidates if c != root]
+    red_herrings = blueprint.get("red_herring_services", [])
+
+    extra: Dict[str, Any] = {}
+    strong_logs: List[str] = []   # root-cause signal
+    distractor_logs: List[str] = []  # weak competing signals
+    rh_logs: List[str] = []       # red-herring noise
+
+    # ------------------------------------------------------------------
+    # Strong root-cause signal  (kind-specific)
+    # ------------------------------------------------------------------
     if kind == "feature_flag_rollout":
         deploy_id = f"deploy-{rng.randint(1000, 9999)}"
         error_rate = rng.randint(45, 95)
@@ -444,12 +604,10 @@ def _cascade_logs(
             "db_pool_size_v2",
             "gateway_shadow_mode",
         ])
-        logs = [
+        strong_logs = [
             f"WARN  deploy-bot: {deploy_id} rolled out config change flag={flag_name} to {root}",
             f"ERROR {root}: error_rate={error_rate}% after {deploy_id}",
             f"CRIT  {root}: rollback feature flag {flag_name} immediately",
-            f"WARN  {affected[1]}: dependency {root} unhealthy - 50% of requests failing",
-            f"ERROR {affected[2]}: read traffic spike after {root} degradation",
             f"ERROR {root}: p99_latency={latency_p99}ms - breaching SLO",
         ]
         extra = {"root_cause_deploy": deploy_id, "root_cause_flag": flag_name}
@@ -461,67 +619,96 @@ def _cascade_logs(
             "session_cache_bypass",
         ])
         error_rate = rng.randint(40, 90)
-        logs = [
+        strong_logs = [
             f"WARN  deploy-bot: {deploy_id} pushed config={config_key} to {root}",
             f"ERROR {root}: auth failures spiked to {error_rate}% after {deploy_id}",
             f"CRIT  {root}: rollback config {config_key} or disable the change",
-            f"WARN  {affected[1]}: upstream {root} rejecting session validation",
-            f"ERROR {affected[2]}: downstream dependency {root} unhealthy",
             "WARN  pagerduty: login traffic degraded across edge and user APIs",
         ]
         extra = {"root_cause_deploy": deploy_id, "root_cause_flag": config_key}
     elif kind == "database_saturation":
         connection_pct = rng.randint(95, 100)
-        lag_seconds = rng.randint(8, 20)
         waiting = rng.randint(120, 260)
-        logs = [
-            f"ERROR {root}: max_connections reached current={connection_pct}%",
+        strong_logs = [
+            f"CRIT  {root}: max_connections {connection_pct}%",
             f"CRIT  {root}: scale connections or kill query to recover the pool",
-            f"WARN  {affected[1]}: replication lag {lag_seconds}s - read traffic timing out",
-            f"ERROR {affected[2]}: dependency {root} pool exhausted waiting={waiting}",
+            f"INFO  load-balancer: {root} health check PASS"  # deliberate noise ~40%
+            if rng.random() < 0.4 else
+            f"ERROR {root}: pool exhausted — waiting={waiting} connections queued",
             "WARN  pagerduty: database saturation is cascading to downstream services",
-            f"INFO  {root}: slow transaction backlog waiting={waiting}",
         ]
         extra = {}
     elif kind == "payment_rate_limit":
         rate_limited = rng.randint(120, 480)
         queue_depth = rng.randint(300, 1200)
-        logs = [
+        strong_logs = [
             f"ERROR {root}: upstream 429 Too Many Requests count={rate_limited}",
             f"CRIT  {root}: rate limit exceeded - throttle batch jobs and backoff retries",
-            f"WARN  {affected[1]}: retry queue depth={queue_depth} after upstream rejection",
-            f"ERROR {affected[2]}: checkout latency elevated while {root} retries backlog",
-            "WARN  pagerduty: payment pipeline saturation causing edge impact",
             f"INFO  {root}: current request rate {rng.randint(420, 650)} req/s",
+            "WARN  pagerduty: payment pipeline saturation causing edge impact",
         ]
         extra = {}
     elif kind == "search_index_fault":
         shard = rng.randint(1, 24)
         cache_bytes = rng.randint(128, 640)
-        logs = [
+        strong_logs = [
             f"ERROR {root}: corrupt index shard={shard} on live query path",
             f"CRIT  {root}: purge cache and rebuild index before retrying traffic",
-            f"WARN  {affected[1]}: recommendations degraded because {root} is timing out",
-            f"ERROR {affected[2]}: upstream {root} timeout budget exceeded",
             f"INFO  indexer: stale cache footprint={cache_bytes}MB",
             "WARN  pagerduty: search dependency is cascading into serving path",
         ]
         extra = {}
-    else:
+    else:  # inventory_canary_fault
         deploy_id = f"deploy-{rng.randint(1000, 9999)}"
         restart_count = rng.randint(4, 10)
         canary = rng.choice(["stock_sync_v2", "reservation_path", "inventory_async_write"])
-        logs = [
+        strong_logs = [
             f"WARN  deploy-bot: {deploy_id} enabled canary {canary} on {root}",
             f"ERROR {root}: canary regression detected after {deploy_id}",
             f"CRIT  {root}: rollback canary {canary} and restart pods",
-            f"WARN  {affected[1]}: dependency {root} returning stale inventory",
-            f"ERROR {affected[2]}: checkout failures rising with {root} instability",
             f"INFO  k8s: restarted {root}-{rng.randint(100, 999)} count={restart_count}",
         ]
         extra = {"root_cause_deploy": deploy_id, "root_cause_flag": canary}
 
-    return _stamp_logs(logs, base_epoch, interval_minutes=1), extra
+    # ------------------------------------------------------------------
+    # Fan-in distractor logs  (1-2 per non-root candidate)
+    # ------------------------------------------------------------------
+    _distractor_templates = [
+        "{svc}: connection pool pressure — upstream unclear",
+        "{svc}: eviction rate elevated — may indicate upstream issue",
+        "{svc}: request latency spike — investigating dependency chain",
+        "{svc}: health check returned marginal — not yet critical",
+        "{svc}: error budget burn rate elevated — root cause unknown",
+    ]
+    for d in distractors:
+        tmpl = rng.choice(_distractor_templates)
+        prefix = rng.choice(["WARN ", "WARN "])
+        distractor_logs.append(f"{prefix} {tmpl.format(svc=d)}")
+
+    # ------------------------------------------------------------------
+    # Red-herring service logs  (look alarming, but service is healthy)
+    # ------------------------------------------------------------------
+    _rh_templates = [
+        "{svc}: upstream dependency errors — retrying",
+        "{svc}: downstream call failure — probing services",
+        "{svc}: elevated error rate — root cause under investigation",
+    ]
+    for rh in red_herrings:
+        tmpl = rng.choice(_rh_templates)
+        rh_logs.append(f"ERROR {tmpl.format(svc=rh)}")
+
+    # ------------------------------------------------------------------
+    # Optional: PASS noise on actual root (~40% of seeds)
+    # ------------------------------------------------------------------
+    if rng.random() < 0.4:
+        distractor_logs.append(
+            f"INFO  load-balancer: {root} health check PASS"
+        )
+
+    # Combine, shuffle, cap at 8
+    all_logs = strong_logs + distractor_logs + rh_logs
+    rng.shuffle(all_logs)
+    return _stamp_logs(all_logs[:8], base_epoch, interval_minutes=1), extra
 
 
 def _generate_cascading_failure(
@@ -529,17 +716,41 @@ def _generate_cascading_failure(
     seed: int,
     rng: random.Random,
 ) -> dict:
-    """Generate a seed-varying cascading failure across three services."""
+    """Generate a seed-varying cascading failure with fan-in ambiguity."""
     blueprint = _CASCADE_BLUEPRINTS[
         _select_blueprint_index(seed, len(_CASCADE_BLUEPRINTS), 0)
     ]
-    logs, extra = _cascade_logs(blueprint, base_epoch, rng)
+
+    # Fan-in: pick actual root cause from candidates using rng
+    candidates = blueprint.get("fan_in_candidates", [blueprint.get("root_cause_service")])
+    actual_root = rng.choice(candidates)
+
+    # Red herrings: services that look broken but aren't
+    red_herrings = blueprint.get("red_herring_services", [])
+
+    logs, extra = _cascade_logs(blueprint, base_epoch, rng, actual_root=actual_root)
+
+    # Build the causal fan-in DAG for this seed
+    fan_in_dag = build_fan_in_dag(blueprint, rng, actual_root)
 
     incident = {
         "title": blueprint["title"],
         "severity": blueprint["severity"],
-        "affected_services": list(blueprint["affected_services"]),
-        "root_cause_service": blueprint["root_cause_service"],
+        "affected_services": list(dict.fromkeys(
+            list(blueprint["affected_services"]) + candidates + red_herrings
+        )),
+        "root_cause_service": actual_root,           # actual root, hidden from agent
+        "fan_in_candidates": candidates,              # all suspects, for belief grader
+        "red_herring_services": red_herrings,         # passed to simulator
+        "fan_in_dag": {
+            # Only expose agent-visible fields; true_edges stay server-side
+            "nodes":          fan_in_dag["nodes"],
+            "edges":          fan_in_dag["edges"],
+            "root":           fan_in_dag["root"],         # hidden from agent prompt
+            "spurious_edges": fan_in_dag["spurious_edges"],   # stored server-side
+            "missing_edges":  fan_in_dag["missing_edges"],    # stored server-side
+            "true_edges":     fan_in_dag["true_edges"],       # stored server-side
+        },
         "logs": logs,
         "correct_team": blueprint["correct_team"],
         "team_map": dict(blueprint["team_map"]),
@@ -649,3 +860,34 @@ def _generate_ambiguous_payment_degradation(
             }
         ],
     }
+
+
+if __name__ == "__main__":
+    import json
+
+    for seed in range(20):
+        inc = generate_incident("cascading_failure", seed)
+        candidates = inc.get("fan_in_candidates", [])
+        root = inc.get("root_cause_service", "")
+        red = inc.get("red_herring_services", [])
+        affected = inc.get("affected_services", [])
+        assert root in candidates, (
+            f"seed {seed}: root {root!r} not in candidates {candidates}"
+        )
+        assert all(r in affected for r in red), (
+            f"seed {seed}: red herring not in affected_services"
+        )
+        assert root in affected, (
+            f"seed {seed}: root {root!r} not in affected_services {affected}"
+        )
+        # Root signal should NOT always be the first log (shuffled)
+        first_log = inc["logs"][0]
+        print(f"seed={seed:2d} root={root:<22} first_log={first_log[25:65]}")
+
+    # Prove fan-in rotation: at least 4 distinct roots across 20 seeds
+    roots = {
+        generate_incident("cascading_failure", s)["root_cause_service"]
+        for s in range(20)
+    }
+    assert len(roots) >= 4, f"Only {len(roots)} distinct roots found: {roots}"
+    print(f"\nAll 20 seeds pass. Distinct roots ({len(roots)}): {sorted(roots)}")

@@ -24,7 +24,7 @@ from openenv.core.env_server import create_fastapi_app
 from fastapi import Header
 from fastapi.responses import JSONResponse
 
-from models import IncidentAction, IncidentObservation
+from models import IncidentAction, IncidentObservation, ResetRequest, StepRequest
 from server.environment import IncidentResponseEnv
 from server.tasks import TASK_CONFIGS
 
@@ -91,6 +91,12 @@ _env = IncidentResponseEnv()
 
 # Pass the class + type hints — framework instantiates per session.
 app = create_fastapi_app(lambda: _env, IncidentAction, IncidentObservation)
+
+# Remove any /state route the framework registered so our custom override wins.
+# The framework passes the bound method object instead of calling it, producing
+# a ResponseValidationError 500.  Our @app.get("/state") below calls env.state()
+# correctly and returns s.model_dump().
+app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/state"]
 
 
 # ===================================================================
@@ -189,14 +195,20 @@ def incident_meta(
             "root_cause_service": "",
             "affected_services": [],
         }
+    dag = inc.get("fan_in_dag", {})
     return {
-        "root_cause":        inc.get("root_cause", ""),
-        "team":              inc.get("team", ""),
-        "correct_team":      inc.get("correct_team", ""),
-        "valid_mitigations": inc.get("valid_mitigations", []),
+        "root_cause":         inc.get("root_cause", ""),
+        "team":               inc.get("team", ""),
+        "correct_team":       inc.get("correct_team", ""),
+        "valid_mitigations":  inc.get("valid_mitigations", []),
         "root_cause_service": inc.get("root_cause_service", ""),
-        "affected_services": inc.get("affected_services", []),
-        "runbook_queries":   env._runbook_queries,
+        "affected_services":  inc.get("affected_services", []),
+        "runbook_queries":    env._runbook_queries,
+        # Causal fan-in DAG — agent-visible topology (nodes + observable edges only)
+        "fan_in_dag": {
+            "nodes": dag.get("nodes", []),
+            "edges": dag.get("edges", []),
+        } if dag else {},
     }
 
 

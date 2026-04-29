@@ -29,6 +29,14 @@ from server.simulator import IncidentSimulator
 from server.tasks import TASK_CONFIGS
 
 
+# ---------------------------------------------------------------------------
+# Belief calibration reward weights
+# ---------------------------------------------------------------------------
+
+R2_WEIGHT        = 0.15   # Brier-score calibration contribution per step
+STABILITY_WEIGHT = 0.05   # KL-divergence stability penalty (applied directly)
+
+
 # Canonical action categories returned by _parse_action
 _ACTION_KEYWORDS: Dict[str, List[str]] = {
     "investigate": ["investigate", "analyze", "examine", "inspect", "check", "look",
@@ -87,6 +95,9 @@ class IncidentResponseEnv(Environment):
         self._episode_id: str = str(uuid4())
         self._latest_logs: List[str] = []
         self._latest_metrics: List[Dict[str, Any]] = []
+        # Belief trajectory — populated from agent reasoning each step
+        self._belief_trajectory: List[Dict[str, float]] = []
+        self._last_reported_belief: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # OpenEnv API
@@ -142,6 +153,8 @@ class IncidentResponseEnv(Environment):
         self._latest_metrics = (
             self._simulator.current_metrics() if self._simulator else []
         )
+        self._belief_trajectory = []
+        self._last_reported_belief = {}
         self._initialized = True
 
         # 5. Return fully-populated observation
@@ -193,6 +206,27 @@ class IncidentResponseEnv(Environment):
         # Store reasoning for grader access
         if action.reasoning:
             self._reasoning_texts.append(action.reasoning)
+
+        # Parse and store agent-reported belief for R2 trajectory grading
+        parsed_belief = self._parse_belief_from_reasoning(action.reasoning or "")
+        step_brier_reward     = 0.0
+        step_stability_reward = 0.0
+        if parsed_belief:
+            # Compute stability BEFORE appending (compares new vs previous)
+            if self._belief_trajectory:
+                self._belief_trajectory.append(parsed_belief)
+                step_stability_reward = self._compute_stability_reward()
+            else:
+                self._belief_trajectory.append(parsed_belief)
+            self._last_reported_belief = parsed_belief
+            # Per-step Brier contribution toward R2
+            _rc   = self._incident_data.get("root_cause_service", "")
+            _cands = self._incident_data.get("fan_in_candidates", [])
+            if _rc and _cands:
+                step_brier_reward = self._compute_step_brier(
+                    parsed_belief, _rc, _cands
+                )
+        # If None: no belief this step — calibration rewards stay 0.0
 
         # 1. Parse
         parsed_action = self._parse_action(raw_text)
@@ -276,6 +310,13 @@ class IncidentResponseEnv(Environment):
             severity_before=severity_before,
             severity_after=severity_after,
         )
+
+        # Calibration reward: R2 (Brier) + stability (KL penalty)
+        # step_brier_reward  in [0.0, 1.0] → scaled by R2_WEIGHT
+        # step_stability_reward in [-0.10, 0.0] → applied directly
+        step_reward += R2_WEIGHT * step_brier_reward
+        step_reward += step_stability_reward
+        step_reward  = max(-1.0, min(2.0, step_reward))
 
         # 5. Bookkeeping
         self._step_count += 1
@@ -388,6 +429,22 @@ class IncidentResponseEnv(Environment):
             # Expose agent reasoning + runbook queries for grading
             info["agent_reasoning"] = " ".join(self._reasoning_texts)
             info["runbook_queries"] = list(self._runbook_queries)
+            # Belief trajectory for R2 grader
+            info["belief_trajectory"] = self._belief_trajectory
+            info["last_reported_belief"] = self._last_reported_belief
+            info["fan_in_candidates"] = self._incident_data.get("fan_in_candidates", [])
+            info["red_herring_services"] = self._incident_data.get("red_herring_services", [])
+            info["fan_in_dag"] = self._incident_data.get("fan_in_dag", {})
+            # R2 calibration score over full belief trajectory
+            info["r2_score"] = self._compute_r2_reward()
+            info["belief_brier_per_step"] = [
+                self._compute_step_brier(
+                    b,
+                    self._incident_data.get("root_cause_service", ""),
+                    self._incident_data.get("fan_in_candidates", []),
+                )
+                for b in self._belief_trajectory
+            ]
             if self._simulator:
                 info["simulator_snapshot"] = self._simulator.snapshot()
                 info["simulator_recovered"] = self._simulator.is_fully_recovered()
@@ -406,6 +463,128 @@ class IncidentResponseEnv(Environment):
     def incident_data(self) -> Dict[str, Any]:
         """Expose incident data for the /incident-meta endpoint."""
         return self._incident_data
+
+    # ------------------------------------------------------------------
+    # Belief parsing  (agent self-reports belief each step)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_belief_from_reasoning(reasoning: str) -> Optional[Dict[str, float]]:
+        """Extract belief dict from agent reasoning text.
+
+        Looks for pattern: Belief: {"auth-service": 0.7, "db-primary": 0.2}
+        Returns None on any parse failure — caller assigns R2=0, does NOT drop rollout.
+        """
+        if not reasoning:
+            return None
+        import ast
+        match = re.search(r'[Bb]elief\s*[:=]\s*(\{[^}]+\})', reasoning)
+        if not match:
+            return None
+        try:
+            raw = match.group(1)
+            # Handle both quoted and unquoted hyphenated keys
+            raw = re.sub(r'([\w][\w\-]*)\s*:', r'"\1":', raw)
+            parsed = ast.literal_eval(raw)
+            if not isinstance(parsed, dict):
+                return None
+            # Normalise to float values
+            return {str(k): float(v) for k, v in parsed.items()}
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # R2 calibration reward — Brier-score belief trajectory grading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_step_brier(
+        belief: Dict[str, float],
+        root: str,
+        candidates: List[str],
+    ) -> float:
+        """Brier score for one belief snapshot.
+
+        Brier_t = 1 - (1/N) * Σ_i (p_i - y_i)^2
+        where y_i = 1.0 if service i is the true root, else 0.0.
+        N = number of candidates (normalises across incident sizes).
+
+        Returns a value in [0.0, 1.0]; 1.0 = perfect calibration.
+        """
+        if not candidates:
+            return 0.0
+        brier_sum = 0.0
+        for c in candidates:
+            p = float(belief.get(c, 0.0))
+            y = 1.0 if c == root else 0.0
+            brier_sum += (p - y) ** 2
+        return max(0.0, 1.0 - brier_sum / len(candidates))
+
+    def _compute_r2_reward(self) -> float:
+        """Time-weighted Brier-score calibration over the full belief trajectory.
+
+        Only active for cascading_failure (which exposes root_cause_service +
+        fan_in_candidates).  Returns 0.0 for other tasks or empty trajectories.
+
+        Formula:
+            R2 = final_brier * 0.6 + avg_brier * 0.4
+
+        The 60/40 split forces:
+          - Correct final answer  (convergence by episode end)
+          - Good trajectory       (consistent reasoning, not lucky last step)
+
+        Range: [0.0, 1.0]
+        """
+        if self._task_id != "cascading_failure":
+            return 0.0
+        if not self._belief_trajectory:
+            return 0.0
+
+        root       = self._incident_data.get("root_cause_service", "")
+        candidates = self._incident_data.get("fan_in_candidates", [])
+        if not root or not candidates:
+            return 0.0
+
+        brier_per_step = [
+            self._compute_step_brier(b, root, candidates)
+            for b in self._belief_trajectory
+        ]
+        avg_brier   = sum(brier_per_step) / len(brier_per_step)
+        final_brier = brier_per_step[-1]
+
+        r2 = final_brier * 0.6 + avg_brier * 0.4
+        return max(0.0, min(1.0, r2))
+
+    def _compute_stability_reward(self) -> float:
+        """Symmetric KL-divergence penalty for oscillating belief.
+
+        Compares the last two entries in self._belief_trajectory.
+        Call AFTER appending the new belief so index [-1] is current,
+        index [-2] is previous.
+
+        Returns a value in [-0.10, 0.0]:
+            0.0   — belief is stable (low symmetric KL)
+            -0.10 — belief oscillates wildly (high symmetric KL)
+
+        Replaces explicit belief injection in the prompt with an *incentive*
+        for smooth, evidence-driven updates instead of random flipping.
+        """
+        if len(self._belief_trajectory) < 2:
+            return 0.0
+        import math
+        prev = self._belief_trajectory[-2]
+        curr = self._belief_trajectory[-1]
+        all_keys = set(prev.keys()) | set(curr.keys())
+        eps = 1e-9
+        sym_kl = 0.0
+        for k in all_keys:
+            p = max(float(prev.get(k, 0.0)), eps)
+            q = max(float(curr.get(k, 0.0)), eps)
+            # Symmetric KL: KL(p‖q) + KL(q‖p)
+            sym_kl += p * math.log(p / q) + q * math.log(q / p)
+        # Map to [-0.10, 0.0]: sym_kl ≈ 0 → 0 penalty; sym_kl ≥ 2 → -0.10
+        penalty = min(0.10, sym_kl * 0.05)
+        return -penalty
 
     # ------------------------------------------------------------------
     # Action parsing  (pure keyword matching)

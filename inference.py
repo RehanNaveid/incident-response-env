@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Tuple
 # from dotenv import load_dotenv
@@ -232,11 +233,21 @@ def _build_client() -> OpenAI:
 # LLM helper
 # ---------------------------------------------------------------------------
 
-def ask_llm(client: OpenAI, observation: Dict[str, Any],
-            history: List[Dict], action_history: List[str]) -> Tuple[str, str]:
+def ask_llm(
+    client: OpenAI,
+    observation: Dict[str, Any],
+    history: List[Dict],
+    action_history: List[str],
+) -> Tuple[str, str, str]:
     """Build a prompt, include conversation history, call the LLM.
 
-    Returns (action_str, reasoning_str).
+    Returns (action_str, reasoning_str, raw_response_text).
+    reasoning_str packs Thought + Belief so env._parse_belief_from_reasoning()
+    can extract the belief for the R2 grader.
+
+    Belief is NOT re-injected into the prompt — the agent must reconstruct
+    it from the current observation each step (belief-as-output, not input).
+    The stability reward in environment.py incentivises smooth updates.
     """
     obs_prompt = build_prompt(observation, action_history)
     default_service = next(
@@ -245,29 +256,39 @@ def ask_llm(client: OpenAI, observation: Dict[str, Any],
     )
     fallback_action = f"investigate {default_service}"
 
-    # Wrap the observation in a JSON-output prompt
-    user_prompt = f"""
-You are an incident response agent.
+    # Structured output prompt — thought / belief / action
+    user_prompt = f"""You are an incident response agent performing causal inference.
 
-At each step, you MUST output:
-
-1. reasoning: explain WHY you are taking the action (based on logs/metrics)
-2. action: the next action to take
-
-Format STRICTLY as JSON:
+At each step you MUST output valid JSON with exactly these three keys:
 
 {{
-  "reasoning": "...",
-  "action": "..."
+  "thought": "Step-by-step evidence analysis. Which logs point where. What you rule out and why.",
+  "belief": {{"service-name": probability}},
+  "action": "your single action"
 }}
 
-Guidelines:
-- Use logs and metrics as evidence
-- Mention cause-effect (e.g., "high latency suggests DB issue")
-- Be concise but specific
+Rules for belief:
+- Keys are service names from AFFECTED SERVICES only
+- Values are probabilities 0.0–1.0, must sum to approximately 1.0
+- Update belief based on what you just observed, not what you assumed last step
+- If you investigated a service and it looks healthy, lower its probability
+- If a log strongly implicates a service, raise its probability
+
+Rules for thought:
+- Cite specific log lines as evidence
+- State what each investigation revealed
+- Explain why you are raising or lowering each service's probability
+- Never repeat the same thought two steps in a row
+
+Rules for action:
+- ONE action only: investigate <service> | assign to <team> | mitigate: <fix> | resolve
+- Only investigate services in AFFECTED SERVICES
+- Only mitigate after investigating
 
 Current observation:
 {obs_prompt}
+
+Output JSON only. No prose before or after the JSON block.
 """
 
     try:
@@ -280,28 +301,38 @@ Current observation:
             model=MODEL_NAME,
             messages=messages,
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=512,
         )
         response_text = (response.choices[0].message.content or "").strip()
         if not response_text:
-            return fallback_action, ""
+            return fallback_action, "", ""
+
+        # Strip markdown code fences if present
+        cleaned = response_text
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```[\w]*\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```$', '', cleaned)
+            cleaned = cleaned.strip()
 
         # Parse JSON response
         try:
-            parsed = json.loads(response_text)
+            parsed = json.loads(cleaned)
+            thought_str = parsed.get("thought", "").strip()
+            belief_dict = parsed.get("belief", {})
             action_str = parsed.get("action", "").strip()
-            reasoning_str = parsed.get("reasoning", "").strip()
+            # Pack both into reasoning so env._parse_belief_from_reasoning() can find it
+            reasoning_str = f"Thought: {thought_str}\nBelief: {json.dumps(belief_dict)}"
         except Exception:
-            # Fallback: treat entire response as action, no reasoning
-            action_str = response_text.splitlines()[0].strip().strip('"').strip("'")
+            # Fallback: treat first line as action, no reasoning
+            action_str = cleaned.splitlines()[0].strip().strip('"').strip("'")
             reasoning_str = ""
 
         if not action_str:
             action_str = fallback_action
 
-        return action_str, reasoning_str
+        return action_str, reasoning_str, response_text
     except Exception:
-        return fallback_action, ""
+        return fallback_action, "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -639,15 +670,26 @@ def run_task(task_id: str, client: OpenAI, seed: int = FIXED_SEED) -> Dict[str, 
         seed_meta   = get_seed_meta(task_id, observation, session_id=session_id)
         done        = reset_resp.get("done", False)
         history: List[Dict] = []
+        last_belief_dict: Dict[str, float] = {}
 
         # ---- Step loop ----
         while not done and step_num < max_steps:
             step_num += 1
             error: str | None = None
 
-            chosen_action, reasoning_text = ask_llm(
+            chosen_action, reasoning_text, raw_response = ask_llm(
                 client, observation, history, action_history,
             )
+
+            # Parse belief from model's raw response for next-step injection
+            try:
+                parsed_response = json.loads(raw_response) if raw_response else {}
+                last_belief_dict = parsed_response.get("belief", last_belief_dict)
+            except Exception:
+                pass  # keep last known belief
+
+            if not last_belief_dict:
+                print(f"[WARN] step={step_num} belief parse failed — R2=0 this step", flush=True)
 
             history.append({"role": "assistant", "content": chosen_action})
             action_history.append(chosen_action)
