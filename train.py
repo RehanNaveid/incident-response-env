@@ -152,6 +152,7 @@ def load_model() -> Tuple[Any, Any]:
         use_gradient_checkpointing = "unsloth",
         random_state               = 42,
     )
+    tokenizer.pad_token = tokenizer.eos_token
     print("[TRAIN] Model ready.")
     return model, tokenizer
 
@@ -244,6 +245,7 @@ def get_state(session_id: str) -> Dict[str, Any]:
 def parse_output(
     raw: str,
     affected: List[str],
+    belief_candidates: Optional[List[str]] = None,
 ) -> Tuple[str, str, Dict[str, float], bool]:
     """Extract (action, reasoning, belief, parse_ok) from raw model output.
 
@@ -254,8 +256,9 @@ def parse_output(
     """
     first    = affected[0] if affected else "auth-service"
     fallback = f"investigate {first}"
-    n        = max(len(affected), 1)
-    uniform  = {s: round(1.0 / n, 4) for s in affected}
+    candidates = belief_candidates or affected
+    n        = max(len(candidates), 1)
+    uniform  = {s: round(1.0 / n, 4) for s in candidates}
 
     # Strip markdown fences
     text = re.sub(r"^```[\w]*\n?", "", raw.strip())
@@ -284,6 +287,12 @@ def parse_output(
     else:
         belief = {str(k): float(v) for k, v in belief.items()
                   if isinstance(v, (int, float))}
+        belief = {k: max(0.0, belief.get(k, 0.0)) for k in candidates}
+        total = sum(belief.values())
+        if total > 0:
+            belief = {k: v / total for k, v in belief.items()}
+        else:
+            belief = uniform
 
     reasoning = f"Thought: {thought}\nBelief: {json.dumps(belief)}"
     return action, reasoning, belief, True        # parse_ok=True
@@ -412,7 +421,14 @@ def run_episode(model, tokenizer, task: str, seed: int,
             break
 
         affected = obs.get("affected_services", [])
-        action, reasoning, belief, parse_ok = parse_output(raw, affected)
+        belief_candidates = (
+            obs.get("fan_in_candidates")
+            or obs.get("hypotheses")
+            or affected
+        )
+        action, reasoning, belief, parse_ok = parse_output(
+            raw, affected, belief_candidates
+        )
         parse_total += 1
         if parse_ok:
             parse_hits += 1
@@ -590,6 +606,7 @@ def trainer_step(model, tokenizer, optimizer,
         for i in range(NUM_ROLLOUTS):
             ep = run_episode(model, tokenizer, task, seed_base + i,
                              rollout_idx=i)   # F3: unique session per rollout
+            ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
             episodes.append(ep)
             print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
                   f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
@@ -611,25 +628,11 @@ def trainer_step(model, tokenizer, optimizer,
             f"  Run dry_run() to diagnose without updating weights."
         )
 
-    # ---- Per-batch normalisation: z-score BOTH R1 and R2 before blending ----
-    # R1 (cumulative_reward) scale varies by task and episode length.
-    # R2 (r2_score) is always in [0, 1].
-    # When R1-norm spans [-2, 2] and raw R2 spans [0, 1], R2 contributes
-    # ~5x less gradient than the 0.40 weight implies.  Z-scoring both within
-    # the batch ensures each signal carries its intended gradient magnitude.
-    r1_vals  = [ep.cumulative_reward for ep in episodes]
-    r2_vals  = [ep.r2_score          for ep in episodes]
-
-    def _zscore(vals: List[float]) -> List[float]:
-        mean = sum(vals) / max(len(vals), 1)
-        std  = math.sqrt(sum((v - mean) ** 2 for v in vals) / max(len(vals), 1)) + 1e-6
-        return [(v - mean) / std for v in vals]
-
-    r1_normed = _zscore(r1_vals)
-    r2_normed = _zscore(r2_vals)
-
-    for ep, r1_n, r2_n in zip(episodes, r1_normed, r2_normed):
-        ep.blended_reward = 0.6 * r1_n + 0.4 * r2_n
+    # ---- Blended GRPO reward ----
+    # R1 is the environment cumulative reward; divide by 5.0 to keep it on
+    # roughly the same scale as R2.  R2 is the server-computed belief score.
+    for ep in episodes:
+        ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
 
     # ---- Advantages + reward-variance guard ----
     rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
@@ -751,17 +754,9 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
               f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
               f"parse={ep.parse_rate:.0%}  steps={len(ep.steps)}")
 
-    # Compute estimated blended reward so dry-run diagnostic is not misleading.
-    # trainer_step does the real z-score; this is a batch estimate for display.
-    _r1s = [ep.cumulative_reward for ep in eps_collected]
-    _r2s = [ep.r2_score          for ep in eps_collected]
-    _r1m = sum(_r1s) / max(len(_r1s), 1)
-    _r2m = sum(_r2s) / max(len(_r2s), 1)
-    _r1s_std = math.sqrt(sum((v - _r1m)**2 for v in _r1s) / max(len(_r1s), 1)) + 1e-6
-    _r2s_std = math.sqrt(sum((v - _r2m)**2 for v in _r2s) / max(len(_r2s), 1)) + 1e-6
+    # Compute estimated blended reward so dry-run diagnostic mirrors trainer_step().
     blended_est = [
-        0.6 * (ep.cumulative_reward - _r1m) / _r1s_std
-        + 0.4 * (ep.r2_score - _r2m) / _r2s_std
+        0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
         for ep in eps_collected
     ]
     avg_blended_est = sum(blended_est) / max(len(blended_est), 1)
@@ -782,7 +777,7 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
     print(f"  reward_std       : {std_r:.4f}  {'✓ OK' if std_r >= _MIN_REWARD_STD else '✗ LOW — GRPO will be weak'}")
     print(f"  avg_parse_rate   : {avg_p:.1%}  {'✓ OK' if avg_p >= _MIN_PARSE_RATE else '✗ LOW — R2 cannot learn'}")
     print(f"  avg_r2           : {avg_r2:.4f}")
-    print(f"  avg_blended(est) : {avg_blended_est:.4f}  (z-scored R1+R2, batch estimate)")
+    print(f"  avg_blended(est) : {avg_blended_est:.4f}  (0.5*(R1/5) + 0.5*R2)")
     print("[DRY-RUN] ────────────────────────────────────────────────────────")
 
     if avg_p < _MIN_PARSE_RATE:

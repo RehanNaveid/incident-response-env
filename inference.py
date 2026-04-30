@@ -277,6 +277,28 @@ def ask_llm(
             parsed = json.loads(cleaned)
             thought_str = parsed.get("thought", "").strip()
             belief_dict = parsed.get("belief", {})
+            candidates = (
+                observation.get("fan_in_candidates")
+                or observation.get("hypotheses")
+                or observation.get("affected_services", [])
+            )
+            if isinstance(belief_dict, dict) and candidates:
+                belief_dict = {
+                    key: (
+                        max(0.0, float(belief_dict.get(key, 0.0)))
+                        if isinstance(belief_dict.get(key, 0.0), (int, float))
+                        else 0.0
+                    )
+                    for key in candidates
+                }
+                total = sum(belief_dict.values())
+                if total > 0.0:
+                    belief_dict = {
+                        key: value / total
+                        for key, value in belief_dict.items()
+                    }
+                else:
+                    belief_dict = {key: 1.0 / len(candidates) for key in candidates}
             action_str = parsed.get("action", "").strip()
             # Pack both into reasoning so env._parse_belief_from_reasoning() can find it
             reasoning_str = f"Thought: {thought_str}\nBelief: {json.dumps(belief_dict)}"
@@ -380,7 +402,7 @@ STEP 1 — ANALYZE
 - Do NOT assume the first error is the root cause
 
 STEP 2 — UPDATE BELIEF
-- Maintain a probability distribution over affected services: {affected_str}
+- Maintain a probability distribution over the belief keys shown in the JSON template
 - Belief values must sum to approximately 1.0
 - Increase probability for a service when evidence implicates it
 - Decrease probability when investigation shows the service is healthy

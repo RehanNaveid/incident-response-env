@@ -212,6 +212,8 @@ class IncidentResponseEnv(Environment):
         step_r2_reward        = 0.0
         step_stability_reward = 0.0
         if parsed_belief:
+            _cands = self._belief_candidates()
+            parsed_belief = self._normalize_belief(parsed_belief, _cands)
             # Compute stability BEFORE appending (compares new vs previous)
             if self._belief_trajectory:
                 self._belief_trajectory.append(parsed_belief)
@@ -227,11 +229,6 @@ class IncidentResponseEnv(Environment):
             _rc    = (
                 self._incident_data.get("root_cause_service")
                 or self._incident_data.get("root_cause", "")
-            )
-            _cands = (
-                self._incident_data.get("fan_in_candidates")
-                or self._incident_data.get("hypotheses")
-                or self._incident_data.get("affected_services", [])
             )
             # Only meaningful when discriminating between >1 candidate
             if _rc and _cands and len(_cands) > 1:
@@ -445,6 +442,7 @@ class IncidentResponseEnv(Environment):
             info["belief_trajectory"] = self._belief_trajectory
             info["last_reported_belief"] = self._last_reported_belief
             info["fan_in_candidates"] = self._incident_data.get("fan_in_candidates", [])
+            info["hypotheses"] = self._incident_data.get("hypotheses", [])
             info["red_herring_services"] = self._incident_data.get("red_herring_services", [])
             # Agent-visible topology (nodes + noisy edges only)
             info["fan_in_dag"] = self._incident_data.get("fan_in_dag", {})
@@ -456,11 +454,7 @@ class IncidentResponseEnv(Environment):
                 self._incident_data.get("root_cause_service")
                 or self._incident_data.get("root_cause", "")
             )
-            _state_cands = (
-                self._incident_data.get("fan_in_candidates")
-                or self._incident_data.get("hypotheses")
-                or self._incident_data.get("affected_services", [])
-            )
+            _state_cands = self._belief_candidates()
             info["belief_xent_per_step"] = [
                 self._compute_step_xent(b, _state_root, _state_cands)
                 for b in self._belief_trajectory
@@ -519,6 +513,35 @@ class IncidentResponseEnv(Environment):
     # R2 calibration reward — cross-entropy belief trajectory grading
     # ------------------------------------------------------------------
 
+    def _belief_candidates(self) -> List[str]:
+        """Return the active candidate set for R2 grading."""
+        return (
+            self._incident_data.get("fan_in_candidates")
+            or self._incident_data.get("hypotheses")
+            or self._incident_data.get("affected_services", [])
+        )
+
+    @staticmethod
+    def _normalize_belief(
+        belief: Dict[str, float],
+        candidates: List[str],
+    ) -> Dict[str, float]:
+        """Project belief onto candidates and normalise to a distribution."""
+        if not candidates:
+            return dict(belief)
+
+        projected: Dict[str, float] = {}
+        for key in candidates:
+            try:
+                projected[key] = max(0.0, float(belief.get(key, 0.0)))
+            except (TypeError, ValueError):
+                projected[key] = 0.0
+
+        total = sum(projected.values())
+        if total > 0.0:
+            return {key: value / total for key, value in projected.items()}
+        return projected
+
     @staticmethod
     def _compute_step_xent(
         belief: Dict[str, float],
@@ -543,6 +566,7 @@ class IncidentResponseEnv(Environment):
         N = len(candidates)
         if N <= 1:
             return 1.0   # trivially correct — no ambiguity to resolve
+        belief = IncidentResponseEnv._normalize_belief(belief, candidates)
         eps = 1e-9
         p_root = max(float(belief.get(root, 0.0)), eps)
         # Normalise: 1 + log(p_root)/log(N)
@@ -576,11 +600,7 @@ class IncidentResponseEnv(Environment):
             self._incident_data.get("root_cause_service")
             or self._incident_data.get("root_cause", "")
         )
-        candidates = (
-            self._incident_data.get("fan_in_candidates")
-            or self._incident_data.get("hypotheses")
-            or self._incident_data.get("affected_services", [])
-        )
+        candidates = self._belief_candidates()
 
         # R2 only fires when there is genuine ambiguity (N > 1)
         if not root or len(candidates) <= 1:
@@ -842,6 +862,7 @@ class IncidentResponseEnv(Environment):
         # overwhelmed any positive signal from correct investigation actions.
         if (self._task_id == "ambiguous_payment_degradation"
                 and (self._step_count + 1 >= 8 or parsed_action == "resolve")):
+            total_hypotheses = 3
             explored = 0
             if any("db" in a.lower() for a in self._action_history):
                 explored += 1
@@ -849,10 +870,8 @@ class IncidentResponseEnv(Environment):
                 explored += 1
             if any("memory" in a.lower() for a in self._action_history):
                 explored += 1
-            if explored <= 1:
-                reward -= 0.40
-            elif explored == 2:
-                reward -= 0.15
+            remaining = max(0, total_hypotheses - explored)
+            reward -= 0.40 * (remaining / total_hypotheses)
 
         # Stronger redundancy penalty
         if redundant:
