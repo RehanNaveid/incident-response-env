@@ -346,8 +346,14 @@ def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
         else "(first step — no history yet)"
     )
 
-    # Pre-build belief JSON template so the model fills in concrete service names
-    belief_keys = ",  ".join(f'"{s}": <probability>' for s in affected)
+    # Belief keys must match what R2 grades against:
+    #   Task 2: fan_in_candidates    Task 3: hypotheses    Task 1: affected_services
+    belief_candidates = (
+        observation.get("fan_in_candidates")
+        or observation.get("hypotheses")
+        or affected
+    )
+    belief_keys = ",  ".join(f'"{s}": <probability>' for s in belief_candidates)
 
     return f"""\
 You are solving a live production incident.

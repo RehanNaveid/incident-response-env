@@ -177,10 +177,17 @@ def generate(model, tokenizer, prompt: str) -> str:
         return_tensors        = "pt",
     ).to(model.device)
 
+    # Explicit attention mask: all-1s (no padding in our input).
+    # Without this, pad_token==eos_token triggers a spurious warning
+    # on every generate() call because HF can't infer the mask.
+    attention_mask = torch.ones_like(input_ids)
+
     with torch.no_grad():
         out_ids = model.generate(
             input_ids,
+            attention_mask = attention_mask,
             max_new_tokens = MAX_NEW_TOKENS,
+            max_length     = None,   # suppress "both max_new_tokens and max_length set" warning
             temperature    = TEMPERATURE,
             top_p          = TOP_P,
             do_sample      = True,
@@ -326,7 +333,16 @@ def format_stateful_prompt(
     ) or "  (no metrics)"
 
     belief_str  = json.dumps(last_belief, indent=2) if last_belief else "{}"
-    belief_keys = ",  ".join(f'"{s}": <probability>' for s in affected)
+    # Belief keys must match what R2 grades against:
+    #   Task 2: fan_in_candidates (service names)
+    #   Task 3: hypotheses (db_overload, rate_limit, memory_leak)
+    #   Task 1: affected_services (single service, R2 is trivial)
+    belief_candidates = (
+        obs.get("fan_in_candidates")
+        or obs.get("hypotheses")
+        or affected
+    )
+    belief_keys = ",  ".join(f'"{s}": <probability>' for s in belief_candidates)
 
     return f"""\
 Task: {task_id}  |  Severity: {severity}  |  SLA remaining: {sla} min

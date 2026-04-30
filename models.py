@@ -81,6 +81,11 @@ class IncidentObservation(Observation):
     outcome: Dict[str, Any] = Field(default_factory=dict)
     sla_remaining: int = 0
     team_roster: Dict[str, str] = Field(default_factory=dict)
+    # Belief candidates — tells the agent what to distribute belief over.
+    # Task 2: fan_in_candidates (service names); Task 3: hypotheses.
+    # NOT secret: they are the "question", not the "answer".
+    hypotheses: List[str] = Field(default_factory=list)
+    fan_in_candidates: List[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

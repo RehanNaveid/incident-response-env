@@ -220,14 +220,17 @@ class IncidentResponseEnv(Environment):
                 self._belief_trajectory.append(parsed_belief)
             self._last_reported_belief = parsed_belief
             # Per-step cross-entropy contribution toward R2
-            # Works for any task: fan_in_candidates takes priority;
-            # falls back to affected_services for ambiguous_payment_degradation.
+            # Resolution chain: fan_in_candidates → hypotheses → affected_services
+            # Task 3 ambiguity is between HYPOTHESES (db_overload/rate_limit/memory_leak),
+            # not services. Without 'hypotheses' in the chain, candidates = ['payment-service']
+            # → len=1 → R2 silently returns 0 for every task 3 episode.
             _rc    = (
                 self._incident_data.get("root_cause_service")
                 or self._incident_data.get("root_cause", "")
             )
             _cands = (
                 self._incident_data.get("fan_in_candidates")
+                or self._incident_data.get("hypotheses")
                 or self._incident_data.get("affected_services", [])
             )
             # Only meaningful when discriminating between >1 candidate
@@ -449,12 +452,17 @@ class IncidentResponseEnv(Environment):
             info["fan_in_dag_ground_truth"] = self._incident_data.get("_fan_in_dag_ground_truth", {})
             # R2 calibration score over full belief trajectory
             info["r2_score"] = self._compute_r2_reward()
+            _state_root = (
+                self._incident_data.get("root_cause_service")
+                or self._incident_data.get("root_cause", "")
+            )
+            _state_cands = (
+                self._incident_data.get("fan_in_candidates")
+                or self._incident_data.get("hypotheses")
+                or self._incident_data.get("affected_services", [])
+            )
             info["belief_xent_per_step"] = [
-                self._compute_step_xent(
-                    b,
-                    self._incident_data.get("root_cause_service", ""),
-                    self._incident_data.get("fan_in_candidates", []),
-                )
+                self._compute_step_xent(b, _state_root, _state_cands)
                 for b in self._belief_trajectory
             ]
             if self._simulator:
@@ -570,6 +578,7 @@ class IncidentResponseEnv(Environment):
         )
         candidates = (
             self._incident_data.get("fan_in_candidates")
+            or self._incident_data.get("hypotheses")
             or self._incident_data.get("affected_services", [])
         )
 
@@ -826,7 +835,13 @@ class IncidentResponseEnv(Environment):
             elif parsed_action == "unknown" and severity_delta < -0.05:
                 reward -= 0.10
 
-        if self._task_id == "ambiguous_payment_degradation":
+        # Task 3 exploration penalty — applied ONCE on the final step only.
+        # The old per-step version applied -0.40 EVERY step until all 3 hypotheses
+        # were explored.  Over 8 steps with 1 hypothesis: 8 * -0.40 = -3.20.
+        # This made cumulative reward catastrophically negative (R=-6.28) and
+        # overwhelmed any positive signal from correct investigation actions.
+        if (self._task_id == "ambiguous_payment_degradation"
+                and (self._step_count + 1 >= 8 or parsed_action == "resolve")):
             explored = 0
             if any("db" in a.lower() for a in self._action_history):
                 explored += 1
@@ -934,4 +949,7 @@ class IncidentResponseEnv(Environment):
             outcome=outcome,
             sla_remaining=sla_remaining,
             team_roster=team_roster,
+            # Belief candidates for R2-aligned belief prompting
+            hypotheses=inc.get("hypotheses", []),
+            fan_in_candidates=inc.get("fan_in_candidates", []),
         )
