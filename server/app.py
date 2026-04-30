@@ -227,7 +227,10 @@ def runbook(
     without giving away the incident's actual root cause.  This enriches
     the observation space and rewards agents that use available tooling.
     """
-    inc = _env.incident_data
+    # Use the per-session env — during multi-session training (6 concurrent
+    # rollouts) the global _env holds a different incident than the caller's.
+    env = _sessions.get(x_session_id) or _env
+    inc = env.incident_data
     team_map: Dict[str, str] = inc.get("team_map", {})
 
     if service not in inc.get("affected_services", []):
@@ -237,8 +240,8 @@ def runbook(
             "message": "No runbook entry — service not in incident scope.",
         }
 
-    if service not in _env._runbook_queries:
-        _env._runbook_queries.append(service)
+    if service not in env._runbook_queries:
+        env._runbook_queries.append(service)
 
     if inc.get("root_cause") == "db_overload" and inc.get("affected_services") == ["payment-service"]:
         return {

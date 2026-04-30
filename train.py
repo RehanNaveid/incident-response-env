@@ -486,19 +486,31 @@ def compute_loss(model, tokenizer,
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": step.prompt},
             ]
-            prompt_ids = tokenizer.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True,
-                return_tensors="pt",
-            ).to(device)
-
-            compl_ids = tokenizer(
-                step.completion, return_tensors="pt", add_special_tokens=False,
+            # Tokenize the full sequence (prompt + completion) via chat template
+            # so BOS/EOS are inserted at the correct positions only once.
+            # Separate tokenization + concat shifts label indices by 1-2 tokens.
+            full_text = tokenizer.apply_chat_template(
+                msgs + [{"role": "assistant", "content": step.completion}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            full_ids = tokenizer(
+                full_text, return_tensors="pt", add_special_tokens=False,
             ).input_ids.to(device)
 
-            input_ids = torch.cat([prompt_ids, compl_ids], dim=-1)
-            labels    = torch.full_like(input_ids, -100)
-            labels[0, prompt_ids.shape[-1]:] = compl_ids[0]
+            # Compute prompt length from the template (without the assistant turn)
+            prompt_text = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+            )
+            prompt_len = tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False,
+            ).input_ids.shape[-1]
 
+            # Mask prompt tokens; supervise only the completion span
+            labels = torch.full_like(full_ids, -100)
+            labels[0, prompt_len:] = full_ids[0, prompt_len:]
+
+            input_ids = full_ids
             out = model(input_ids=input_ids, labels=labels)
             losses.append(-adv_t * out.loss)   # scalar tensor, tracked
 
@@ -553,17 +565,23 @@ def trainer_step(model, tokenizer, optimizer,
       - Warns if reward std < _MIN_REWARD_STD (GRPO has no signal)
     """
     # ---- Rollouts ----
-    FastLanguageModel.for_inference(model)
+    # try/finally guarantees for_training() is always called even if
+    # run_episode raises mid-rollout (env timeout, JSON crash, etc.).
+    # Without this, all subsequent gradient steps compute on a frozen model.
     episodes: List[Episode] = []
-    for i in range(NUM_ROLLOUTS):
-        ep = run_episode(model, tokenizer, task, seed_base + i,
-                         rollout_idx=i)   # F3: unique session per rollout
-        episodes.append(ep)
-        print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
-              f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
-              f"blended={ep.blended_reward:.4f}  "
-              f"steps={len(ep.steps)}  done={ep.done}  "
-              f"parse={ep.parse_rate:.0%}")
+    try:
+        FastLanguageModel.for_inference(model)
+        for i in range(NUM_ROLLOUTS):
+            ep = run_episode(model, tokenizer, task, seed_base + i,
+                             rollout_idx=i)   # F3: unique session per rollout
+            episodes.append(ep)
+            print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
+                  f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
+                  f"blended={ep.blended_reward:.4f}  "
+                  f"steps={len(ep.steps)}  done={ep.done}  "
+                  f"parse={ep.parse_rate:.0%}")
+    finally:
+        FastLanguageModel.for_training(model)
 
     # ---- Parse-rate guard ----
     avg_parse = sum(ep.parse_rate for ep in episodes) / max(len(episodes), 1)
@@ -577,17 +595,25 @@ def trainer_step(model, tokenizer, optimizer,
             f"  Run dry_run() to diagnose without updating weights."
         )
 
-    # ---- Fix 3: per-batch R1 normalisation (replaces hardcoded /5.0) ----
-    # R1 (cumulative_reward) scale varies by task; normalising within the
-    # current rollout batch ensures both R1 and R2 have comparable gradient
-    # magnitude regardless of task difficulty or episode length.
+    # ---- Per-batch normalisation: z-score BOTH R1 and R2 before blending ----
+    # R1 (cumulative_reward) scale varies by task and episode length.
+    # R2 (r2_score) is always in [0, 1].
+    # When R1-norm spans [-2, 2] and raw R2 spans [0, 1], R2 contributes
+    # ~5x less gradient than the 0.40 weight implies.  Z-scoring both within
+    # the batch ensures each signal carries its intended gradient magnitude.
     r1_vals  = [ep.cumulative_reward for ep in episodes]
-    r1_mean  = sum(r1_vals) / max(len(r1_vals), 1)
-    r1_std   = math.sqrt(sum((r - r1_mean) ** 2 for r in r1_vals)
-                         / max(len(r1_vals), 1)) + 1e-6
-    for ep in episodes:
-        r1_norm           = (ep.cumulative_reward - r1_mean) / r1_std
-        ep.blended_reward = 0.6 * r1_norm + 0.4 * ep.r2_score
+    r2_vals  = [ep.r2_score          for ep in episodes]
+
+    def _zscore(vals: List[float]) -> List[float]:
+        mean = sum(vals) / max(len(vals), 1)
+        std  = math.sqrt(sum((v - mean) ** 2 for v in vals) / max(len(vals), 1)) + 1e-6
+        return [(v - mean) / std for v in vals]
+
+    r1_normed = _zscore(r1_vals)
+    r2_normed = _zscore(r2_vals)
+
+    for ep, r1_n, r2_n in zip(episodes, r1_normed, r2_normed):
+        ep.blended_reward = 0.6 * r1_n + 0.4 * r2_n
 
     # ---- Advantages + reward-variance guard ----
     rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
@@ -690,10 +716,12 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
     tasks  = CURRICULUM[-1]    # use full task pool for worst-case coverage
     rows:  List[Dict] = []
 
+    eps_collected: List = []
     for i in range(n):
         task = tasks[i % len(tasks)]
         seed = SEEDS[i % len(SEEDS)] + 1000   # distinct from training seeds
         ep   = run_episode(model, tokenizer, task, seed)
+        eps_collected.append(ep)
         rows.append({
             "ep":     i + 1,
             "task":   task[:20],
@@ -706,6 +734,21 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
         print(f"  ep={i+1:02d}  task={task[:22]:<24}  "
               f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
               f"parse={ep.parse_rate:.0%}  steps={len(ep.steps)}")
+
+    # Compute estimated blended reward so dry-run diagnostic is not misleading.
+    # trainer_step does the real z-score; this is a batch estimate for display.
+    _r1s = [ep.cumulative_reward for ep in eps_collected]
+    _r2s = [ep.r2_score          for ep in eps_collected]
+    _r1m = sum(_r1s) / max(len(_r1s), 1)
+    _r2m = sum(_r2s) / max(len(_r2s), 1)
+    _r1s_std = math.sqrt(sum((v - _r1m)**2 for v in _r1s) / max(len(_r1s), 1)) + 1e-6
+    _r2s_std = math.sqrt(sum((v - _r2m)**2 for v in _r2s) / max(len(_r2s), 1)) + 1e-6
+    blended_est = [
+        0.6 * (ep.cumulative_reward - _r1m) / _r1s_std
+        + 0.4 * (ep.r2_score - _r2m) / _r2s_std
+        for ep in eps_collected
+    ]
+    avg_blended_est = sum(blended_est) / max(len(blended_est), 1)
 
     # ---- Aggregate diagnostics ----
     rewards     = [r["reward"] for r in rows]
@@ -723,6 +766,7 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
     print(f"  reward_std       : {std_r:.4f}  {'✓ OK' if std_r >= _MIN_REWARD_STD else '✗ LOW — GRPO will be weak'}")
     print(f"  avg_parse_rate   : {avg_p:.1%}  {'✓ OK' if avg_p >= _MIN_PARSE_RATE else '✗ LOW — R2 cannot learn'}")
     print(f"  avg_r2           : {avg_r2:.4f}")
+    print(f"  avg_blended(est) : {avg_blended_est:.4f}  (z-scored R1+R2, batch estimate)")
     print("[DRY-RUN] ────────────────────────────────────────────────────────")
 
     if avg_p < _MIN_PARSE_RATE:
@@ -751,6 +795,17 @@ def main() -> None:
           f"{STEPS_PER_EPOCH} steps")
     print(f"[TRAIN] Checkpoints    = {OUTPUT_DIR}  "
           f"every {SAVE_STEPS} steps  keep {SAVE_TOTAL}")
+
+    # Preflight: fail fast if env is cold/unreachable before loading the model.
+    # A cold HF Space hangs 30s then raises — this burns A100 time before the
+    # error surfaces.  Ping /health first so failure is instant and obvious.
+    try:
+        _health = requests.get(f"{ENV_URL}/health", timeout=10)
+        _health.raise_for_status()
+        print(f"[TRAIN] Env healthy: {_health.json()}")
+    except Exception as _he:
+        print(f"[TRAIN] ERROR: env not reachable at {ENV_URL!r}: {_he}", file=sys.stderr)
+        sys.exit(1)
 
     model, tokenizer = load_model()
 

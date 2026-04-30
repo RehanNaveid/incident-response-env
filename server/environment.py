@@ -495,8 +495,10 @@ class IncidentResponseEnv(Environment):
             return None
         try:
             raw = match.group(1)
-            # Handle both quoted and unquoted hyphenated keys
-            raw = re.sub(r'([\w][\w\-]*)\s*:', r'"\1":', raw)
+            # Quote only UNQUOTED hyphenated keys.
+            # Old regex `([\w][\w\-]*)\s*:` re-wrapped already-quoted keys,
+            # producing ""auth-service"": which ast.literal_eval rejects silently.
+            raw = re.sub(r'(?<!")(\b[\w][\w\-]*\b)(?!")\s*:', r'"\1":', raw)
             parsed = ast.literal_eval(raw)
             if not isinstance(parsed, dict):
                 return None

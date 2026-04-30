@@ -297,16 +297,19 @@ def grade_task3(action_history: List[str], seed_meta: dict, reasoning_texts=None
         "rate_limit":  ["rate", "stripe", "429", "throttle", "upstream"],
         "memory_leak": ["memory", "heap", "oom", "leak", "gc"],
     }
-    investigated_hypotheses = set()
+    # Track action-investigated separately from reasoning-only.
+    # The depth-penalty gate must use only action_investigated so reasoning-only
+    # credit cannot neutralise the penalty (agent got +0.15 for zero actions).
+    action_investigated: set = set()
     for action in action_history:
         a = action.lower()
         if "investigate" not in a:
             continue
         for hypothesis, keywords in hypothesis_keywords.items():
             if any(kw in a for kw in keywords):
-                investigated_hypotheses.add(hypothesis)
+                action_investigated.add(hypothesis)
 
-    score += min(0.30, len(investigated_hypotheses) * 0.10)
+    score += min(0.30, len(action_investigated) * 0.10)
 
     # Root cause — check correct mitigation keywords used in action context
     valid_mitigations = seed_meta.get("valid_mitigations", [])
@@ -342,15 +345,15 @@ def grade_task3(action_history: List[str], seed_meta: dict, reasoning_texts=None
         score += 0.10
 
     # --- Reasoning field integration ---
-    # Award partial credit if the agent's reasoning mentions hypothesis
-    # keywords even without explicit investigate actions.  This makes
-    # the environment evaluate chain-of-thought, a unique differentiator.
+    # Partial credit if reasoning mentions hypotheses not covered by actions.
+    # Uses a separate set so it cannot affect the action-depth penalty below.
+    reasoning_hypotheses = set(action_investigated)  # copy
     reasoning_text = seed_meta.get("agent_reasoning", "").lower()
     if reasoning_text:
         for hyp, keywords in hypothesis_keywords.items():
-            if hyp not in investigated_hypotheses:
+            if hyp not in reasoning_hypotheses:
                 if any(kw in reasoning_text for kw in keywords):
-                    investigated_hypotheses.add(hyp)
+                    reasoning_hypotheses.add(hyp)
                     score += 0.05  # smaller credit for reasoning-only
 
     # Runbook usage bonus
@@ -359,29 +362,12 @@ def grade_task3(action_history: List[str], seed_meta: dict, reasoning_texts=None
     if any(svc in runbook_queries for svc in affected):
         score += 0.05
 
-    # Count investigated hypotheses
-    # hypothesis_count = 0
-    # investigate_actions = [a for a in action_history if "investigate" in a.lower()]
-    # if any("db" in a.lower() or "database" in a.lower() or "connection" in a.lower() 
-    #     for a in investigate_actions):
-    #     hypothesis_count += 1
-    # if any("rate" in a.lower() or "stripe" in a.lower() or "throttle" in a.lower()
-    #     for a in investigate_actions):
-    #     hypothesis_count += 1
-    # if any("memory" in a.lower() or "heap" in a.lower() or "oom" in a.lower()
-    #     for a in investigate_actions):
-    #     hypothesis_count += 1
-    hypothesis_count = len(investigated_hypotheses)
-    if hypothesis_count == 0:
+    # Depth penalty uses action_investigated ONLY (not inflated by reasoning credit)
+    action_investigated_count = len(action_investigated)
+    if action_investigated_count == 0:
         score -= 0.20
-    elif hypothesis_count == 1:
+    elif action_investigated_count == 1:
         score -= 0.10
-
-    # # Penalize shallow reasoning
-    # if hypothesis_count == 0:
-    #     score -= 0.15  # flat deduction, not a multiplier
-    # elif hypothesis_count == 1:
-    #     score -= 0.05 
 
     # NOTE: _score_reasoning and _score_reasoning_evolution intentionally
     # omitted from live RL grader.  Use eval_score_reasoning() offline.
