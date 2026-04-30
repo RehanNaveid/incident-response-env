@@ -220,9 +220,18 @@ class IncidentResponseEnv(Environment):
                 self._belief_trajectory.append(parsed_belief)
             self._last_reported_belief = parsed_belief
             # Per-step cross-entropy contribution toward R2
-            _rc    = self._incident_data.get("root_cause_service", "")
-            _cands = self._incident_data.get("fan_in_candidates", [])
-            if _rc and _cands:
+            # Works for any task: fan_in_candidates takes priority;
+            # falls back to affected_services for ambiguous_payment_degradation.
+            _rc    = (
+                self._incident_data.get("root_cause_service")
+                or self._incident_data.get("root_cause", "")
+            )
+            _cands = (
+                self._incident_data.get("fan_in_candidates")
+                or self._incident_data.get("affected_services", [])
+            )
+            # Only meaningful when discriminating between >1 candidate
+            if _rc and _cands and len(_cands) > 1:
                 step_r2_reward = self._compute_step_xent(
                     parsed_belief, _rc, _cands
                 )
@@ -532,42 +541,44 @@ class IncidentResponseEnv(Environment):
     def _compute_r2_reward(self) -> float:
         """Episode R2: cross-entropy calibration averaged over ALL episode steps.
 
-        Formula:
-            R2 = (1/T) * Σ_{t=1}^{T} step_xent_t
+        Enabled for ALL tasks with more than one candidate service to
+        discriminate between (i.e. N > 1).  This covers:
+          cascading_failure         → fan_in_candidates (varied per seed)
+          ambiguous_payment_degradation → affected_services (3 services)
+          single_service_outage     → N=1, returns 0.0 (no ambiguity)
 
-        where:
-            T              = self._step_count  (total episode steps)
-            step_xent_t    = _compute_step_xent(belief_t) if belief reported
-            step_xent_t    = 0.0               if no belief at step t
+        Root resolution (first non-empty wins):
+          root_cause_service  → set by cascading_failure / task 1
+          root_cause          → set by ambiguous_payment_degradation task 3
 
-        Zero-scoring missing steps (not dropping them) means the agent is
-        penalised for every step it fails to output a calibrated belief.
+        Candidates resolution (first non-empty wins):
+          fan_in_candidates   → set by build_fan_in_dag
+          affected_services   → universal fallback
 
-        Only active for cascading_failure (has root_cause_service +
-        fan_in_candidates).  Returns 0.0 for other tasks or empty trajectories.
-
+        Formula: R2 = (1/T) * Σ_{t=1}^{T} xent_t
+        Zero-scores missing belief steps (no rollout drop).
         Range: [0.0, 1.0]
         """
-        if self._task_id != "cascading_failure":
+        root = (
+            self._incident_data.get("root_cause_service")
+            or self._incident_data.get("root_cause", "")
+        )
+        candidates = (
+            self._incident_data.get("fan_in_candidates")
+            or self._incident_data.get("affected_services", [])
+        )
+
+        # R2 only fires when there is genuine ambiguity (N > 1)
+        if not root or len(candidates) <= 1:
             return 0.0
         if not self._belief_trajectory:
             return 0.0
 
-        root       = self._incident_data.get("root_cause_service", "")
-        candidates = self._incident_data.get("fan_in_candidates", [])
-        if not root or not candidates:
-            return 0.0
-
-        total_steps = max(self._step_count, 1)   # avoid division by zero
-
-        # Sum cross-entropy rewards for steps where belief was reported
-        # Missing steps contribute 0.0 implicitly (zero-score, no drop)
+        total_steps = max(self._step_count, 1)
         xent_sum = sum(
             self._compute_step_xent(b, root, candidates)
             for b in self._belief_trajectory
         )
-
-        # Divide by TOTAL episode steps, not just len(belief_trajectory)
         return max(0.0, min(1.0, xent_sum / total_steps))
 
     def _compute_stability_reward(self) -> float:

@@ -61,7 +61,7 @@ TARGET_MODULES: List[str] = ["q_proj", "v_proj"]
 # Generation  (0.7–0.9 range for exploration)
 TEMPERATURE:    float = 0.8
 TOP_P:          float = 0.9
-MAX_NEW_TOKENS: int   = 256
+MAX_NEW_TOKENS: int   = 320   # F5: enough for JSON belief; ~20% cheaper than 400
 
 # GRPO
 NUM_ROLLOUTS:   int   = 6        # rollouts per training step (6–8)
@@ -121,10 +121,11 @@ class Episode:
     task_id:           str
     seed:              int
     steps:             List[StepRecord] = field(default_factory=list)
-    cumulative_reward: float = 0.0
-    r2_score:          float = 0.0
+    cumulative_reward: float = 0.0   # server R1 (authoritative)
+    r2_score:          float = 0.0   # server R2
+    blended_reward:    float = 0.0   # F2: 0.5*(R1/5) + 0.5*R2  — used by GRPO
     done:              bool  = False
-    parse_rate:        float = 1.0   # fraction of steps with valid JSON output
+    parse_rate:        float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -194,30 +195,37 @@ def generate(model, tokenizer, prompt: str) -> str:
 # 3.  Environment interaction
 # ---------------------------------------------------------------------------
 
-_SID: str = f"train-{os.getpid()}"
-_HDR: Dict[str, str] = {"X-Session-Id": _SID}
+def _make_session_id(rollout_idx: int = 0) -> str:
+    """F3: unique session per rollout — prevents episode state bleed."""
+    ts = int(time.time() * 1000) % 10_000_000
+    return f"train-{os.getpid()}-{ts}-{rollout_idx}"
 
 
-def reset_env(task: str, seed: int) -> Dict[str, Any]:
+def _hdr(session_id: str) -> Dict[str, str]:
+    return {"X-Session-Id": session_id}
+
+
+def reset_env(task: str, seed: int, session_id: str) -> Dict[str, Any]:
     r = requests.post(f"{ENV_URL}/reset",
                       json={"task_id": task, "seed": seed},
-                      headers=_HDR, timeout=30)
+                      headers=_hdr(session_id), timeout=30)
     r.raise_for_status()
     data = r.json()
     return data.get("observation", data)
 
 
-def step_env(action: str, reasoning: str = "") -> Tuple[Dict[str, Any], float, bool]:
+def step_env(action: str, reasoning: str,
+             session_id: str) -> Tuple[Dict[str, Any], float, bool]:
     r = requests.post(f"{ENV_URL}/step",
                       json={"action": {"action": action, "reasoning": reasoning}},
-                      headers=_HDR, timeout=30)
+                      headers=_hdr(session_id), timeout=30)
     r.raise_for_status()
     d = r.json()
     return d.get("observation", {}), float(d.get("reward", 0.0)), bool(d.get("done", False))
 
 
-def get_state() -> Dict[str, Any]:
-    r = requests.get(f"{ENV_URL}/state", headers=_HDR, timeout=30)
+def get_state(session_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{ENV_URL}/state", headers=_hdr(session_id), timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -278,26 +286,108 @@ def parse_output(
 # 5.  Rollout — one complete episode
 # ---------------------------------------------------------------------------
 
-def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
+# ---------------------------------------------------------------------------
+# 5b.  Stateful training prompt  (Fix 6)
+# ---------------------------------------------------------------------------
+
+def format_stateful_prompt(
+    obs:         Dict[str, Any],
+    last_belief: Dict[str, float],
+    last_action: str,
+) -> str:
+    """Focused POMDP-style delta prompt used during RL training rollouts.
+
+    Instead of re-feeding full history (which duplicates feedback and creates
+    noise), shows only the minimal state delta the agent needs to update belief:
+      1. Previous belief  — what it believed before this step
+      2. Result/feedback  — outcome of last action
+      3. New logs/metrics — fresh evidence
+      4. Update directive — explicit instruction to revise belief then act
+
+    This forms a proper belief-update loop (POMDP filter), not stateless
+    guessing.  history duplication eliminated → cleaner belief gradient.
+    """
+    affected     = obs.get("affected_services", [])
+    affected_str = ", ".join(affected) if affected else "(see logs)"
+    feedback     = obs.get("feedback", "") or ""
+    task_id      = obs.get("task_id", "")
+    severity     = obs.get("severity", "")
+    sla          = obs.get("sla_remaining", "?")
+
+    logs_text = "\n".join(
+        f"  {ln}" for ln in obs.get("logs", [])
+    ) or "  (no new logs)"
+
+    metrics_text = "\n".join(
+        f"  {m.get('service','?')}: error={m.get('error_rate_pct','?')}%  "
+        f"latency={m.get('latency_p99_ms','?')}ms  [{m.get('status','?')}]"
+        for m in obs.get("metrics", [])
+        if isinstance(m, dict)
+    ) or "  (no metrics)"
+
+    belief_str  = json.dumps(last_belief, indent=2) if last_belief else "{}"
+    belief_keys = ",  ".join(f'"{s}": <probability>' for s in affected)
+
+    return f"""\
+Task: {task_id}  |  Severity: {severity}  |  SLA remaining: {sla} min
+Affected services: {affected_str}
+
+--- PREVIOUS BELIEF ---
+{belief_str}
+
+--- RESULT OF LAST ACTION: {last_action or '(first step)'} ---
+{feedback or '(no feedback yet)'}
+
+--- NEW LOGS ---
+{logs_text}
+
+--- LIVE METRICS ---
+{metrics_text}
+
+--- UPDATE YOUR BELIEF AND CHOOSE AN ACTION ---
+
+Using the new evidence above:
+1. Which service is MOST likely the root cause? Update probabilities accordingly.
+2. If you investigated a service and found it healthy, DECREASE its probability significantly.
+3. Choose ONE action: investigate <service> | assign to <team> | mitigate: <fix> | resolve
+
+Return ONLY valid JSON:
+{{
+  "thought": "evidence analysis citing specific log lines",
+  "belief": {{{belief_keys}}},
+  "action": "one valid action"
+}}
+
+If belief incorrect -> R2 reward reduced.  If action incorrect -> R1 reward reduced.
+Now produce your next step.
+"""
+
+
+def run_episode(model, tokenizer, task: str, seed: int,
+                rollout_idx: int = 0) -> Episode:
     """Run one full episode, collecting StepRecords.
 
-    Uses local generate() — no external API.
-    Reward comes exclusively from the environment (/step + /state).
-    parse_rate in the returned Episode = fraction of steps with valid JSON.
+    Fix 3: unique session_id per rollout (pid + timestamp + rollout_idx).
+    Fix 4: /state cumulative_reward is authoritative; local sum is fallback.
+    Fix 6: uses format_stateful_prompt() for focused belief-update context.
     """
-    ep = Episode(task_id=task, seed=seed)
+    ep         = Episode(task_id=task, seed=seed)
+    session_id = _make_session_id(rollout_idx)
+
     try:
-        obs = reset_env(task, seed)
+        obs = reset_env(task, seed, session_id)
     except Exception as e:
         print(f"  [EP] reset failed: {e}")
         return ep
 
-    history:   List[Dict] = []
-    parse_hits: int       = 0
-    parse_total: int      = 0
+    last_belief: Dict[str, float] = {}
+    last_action: str              = ""
+    parse_hits:  int              = 0
+    parse_total: int              = 0
 
     for step_num in range(1, MAX_STEPS_EP + 1):
-        prompt = format_prompt(obs, history)
+        # F6: stateful delta-prompt instead of full history replay
+        prompt = format_stateful_prompt(obs, last_belief, last_action)
 
         try:
             raw = generate(model, tokenizer, prompt)
@@ -306,13 +396,13 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
             break
 
         affected = obs.get("affected_services", [])
-        action, reasoning, _, parse_ok = parse_output(raw, affected)
+        action, reasoning, belief, parse_ok = parse_output(raw, affected)
         parse_total += 1
         if parse_ok:
             parse_hits += 1
 
         try:
-            next_obs, reward, done = step_env(action, reasoning)
+            next_obs, reward, done = step_env(action, reasoning, session_id)
         except Exception as e:
             print(f"  [EP] step_env failed step {step_num}: {e}")
             break
@@ -322,27 +412,30 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
             action=action, reasoning=reasoning,
             reward=reward, parse_ok=parse_ok,
         ))
-        history += [
-            {"role": "user",      "content": prompt},
-            {"role": "assistant", "content": raw},
-        ]
-        obs = next_obs
+        last_belief = belief
+        last_action = action
+        obs         = next_obs
 
         if done:
             ep.done = True
             break
 
-    # Compute per-episode parse rate
     ep.parse_rate = parse_hits / max(parse_total, 1)
 
-    # Final state from environment (R1 + R2 already computed server-side)
+    # F4: /state is authoritative (includes terminal R1 bonus + R2 trajectory)
+    local_sum = sum(s.reward for s in ep.steps)
     try:
-        state = get_state()
-        ep.cumulative_reward = float(state.get("cumulative_reward", 0.0))
+        state = get_state(session_id)
+        ep.cumulative_reward = float(state.get("cumulative_reward") or local_sum)
         ep.r2_score          = float(state.get("info", {}).get("r2_score", 0.0) or 0.0)
     except Exception as e:
         print(f"  [EP] get_state failed: {e}")
-        ep.cumulative_reward = sum(s.reward for s in ep.steps)
+        ep.cumulative_reward = local_sum
+
+    # F2: normalised blended reward for GRPO
+    # R1 range is roughly [-5, +1]; divide by 5 to map to [-1, +0.2]
+    # R2 range is [0, 1] — equal weight after normalisation
+    ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
 
     return ep
 
@@ -352,11 +445,14 @@ def run_episode(model, tokenizer, task: str, seed: int) -> Episode:
 # ---------------------------------------------------------------------------
 
 def grpo_advantages(episodes: List[Episode]) -> List[float]:
-    """Normalise episode rewards within the group (GRPO §3.1).
+    """Normalise blended episode rewards within the group (GRPO §3.1).
 
-    advantage_i = (R_i - mean(R)) / (std(R) + eps)
+    Uses ep.blended_reward = 0.5*(R1/5) + 0.5*R2 so both task accuracy
+    and belief calibration contribute equally to the policy gradient.
+
+    advantage_i = (blended_i - mean) / (std + eps)
     """
-    rewards = [ep.cumulative_reward for ep in episodes]
+    rewards = [ep.blended_reward for ep in episodes]
     mu      = sum(rewards) / max(len(rewards), 1)
     var     = sum((r - mu) ** 2 for r in rewards) / max(len(rewards), 1)
     sigma   = math.sqrt(var)
@@ -459,10 +555,12 @@ def trainer_step(model, tokenizer, optimizer,
     FastLanguageModel.for_inference(model)
     episodes: List[Episode] = []
     for i in range(NUM_ROLLOUTS):
-        ep = run_episode(model, tokenizer, task, seed_base + i)
+        ep = run_episode(model, tokenizer, task, seed_base + i,
+                         rollout_idx=i)   # F3: unique session per rollout
         episodes.append(ep)
         print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
               f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
+              f"blended={ep.blended_reward:.4f}  "
               f"steps={len(ep.steps)}  done={ep.done}  "
               f"parse={ep.parse_rate:.0%}")
 
@@ -479,11 +577,13 @@ def trainer_step(model, tokenizer, optimizer,
         )
 
     # ---- Advantages + reward-variance guard ----
-    rewards   = [ep.cumulative_reward for ep in episodes]
+    rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
     advantages = grpo_advantages(episodes)
-    avg_r   = sum(rewards) / max(len(rewards), 1)
-    avg_r2  = sum(ep.r2_score for ep in episodes) / max(len(episodes), 1)
-    std_r   = math.sqrt(sum((r - avg_r) ** 2 for r in rewards) / max(len(rewards), 1))
+    avg_r   = sum(ep.cumulative_reward for ep in episodes) / max(len(episodes), 1)
+    avg_r2  = sum(ep.r2_score          for ep in episodes) / max(len(episodes), 1)
+    avg_bl  = sum(ep.blended_reward    for ep in episodes) / max(len(episodes), 1)
+    std_r   = math.sqrt(sum((r - sum(rewards)/max(len(rewards),1)) ** 2
+                            for r in rewards) / max(len(rewards), 1))
     best    = max(episodes, key=lambda e: e.cumulative_reward)
     sample  = best.steps[-1].action if best.steps else "N/A"
 
@@ -501,12 +601,13 @@ def trainer_step(model, tokenizer, optimizer,
     optimizer.step()
 
     return {
-        "loss":        loss.item(),
-        "avg_reward":  avg_r,
-        "avg_r2":      avg_r2,
-        "reward_std":  std_r,
-        "parse_rate":  avg_parse,
-        "sample":      sample,
+        "loss":           loss.item(),
+        "avg_reward":     avg_r,
+        "avg_r2":         avg_r2,
+        "avg_blended":    avg_bl,
+        "reward_std":     std_r,
+        "parse_rate":     avg_parse,
+        "sample":         sample,
     }
 
 
@@ -535,6 +636,7 @@ def train(model, tokenizer) -> None:
                 f"loss={metrics['loss']:.6f}  "
                 f"avg_reward={metrics['avg_reward']:.4f}  "
                 f"avg_r2={metrics['avg_r2']:.4f}  "
+                f"avg_blended={metrics['avg_blended']:.4f}  "
                 f"reward_std={metrics['reward_std']:.4f}  "
                 f"parse_rate={metrics['parse_rate']:.0%}  "
                 f"sample_action={metrics['sample']!r}  "
