@@ -53,6 +53,15 @@ def debug_log(message: str) -> None:
     if IR_DEBUG:
         print(f"[DBG] {message}", flush=True)
 
+
+def debug_json(label: str, payload: Dict[str, Any]) -> None:
+    if IR_DEBUG:
+        print(
+            f"[DBG:{label}] "
+            f"{json.dumps(payload, ensure_ascii=False, default=str, indent=2)}",
+            flush=True,
+        )
+
 # Model
 MODEL_ID:       str  = os.environ.get("MODEL_ID", "unsloth/Qwen2.5-3B-Instruct")
 MAX_SEQ_LEN:    int  = int(os.environ.get("MAX_SEQ_LEN", "2048"))
@@ -93,10 +102,10 @@ FINAL_DIR:      str   = "incidentiq-lora"
 # Curriculum
 CURRICULUM: List[List[str]] = [
     ["single_service_outage"],
+    ["single_service_outage", "ambiguous_payment_degradation"],
     ["single_service_outage", "cascading_failure"],
-    ["single_service_outage", "cascading_failure", "ambiguous_payment_degradation"],
 ]
-STEPS_PER_EPOCH: int = int(os.environ.get("STEPS_PER_EPOCH", "10"))
+STEPS_PER_EPOCH: int = int(os.environ.get("STEPS_PER_EPOCH", "15"))
 
 SEEDS: List[int] = [42, 7, 13, 99, 2024, 314]
 
@@ -239,12 +248,38 @@ def reset_env(task: str, seed: int, session_id: str) -> Dict[str, Any]:
 
 def step_env(action: str, reasoning: str,
              session_id: str) -> Tuple[Dict[str, Any], float, bool]:
-    r = requests.post(f"{ENV_URL}/step",
-                      json={"action": {"action": action, "reasoning": reasoning}},
-                      headers=_hdr(session_id), timeout=30)
-    r.raise_for_status()
-    d = r.json()
-    return d.get("observation", {}), float(d.get("reward", 0.0)), bool(d.get("done", False))
+    last_exc = None
+    r = None
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{ENV_URL}/step",
+                json={"action": {"action": action, "reasoning": reasoning}},
+                headers=_hdr(session_id),
+                timeout=30,
+            )
+            r.raise_for_status()
+            d = r.json()
+            return (
+                d.get("observation", {}),
+                float(d.get("reward", 0.0)),
+                bool(d.get("done", False)),
+            )
+        except Exception as e:
+            last_exc = e
+            if attempt == 2:
+                print("\n[ENV HARD FAILURE]", flush=True)
+                print(f"  action:    {action}", flush=True)
+                print(f"  reasoning: {reasoning[:200]}", flush=True)
+                if r is not None:
+                    try:
+                        print(f"  response:  {r.text[:500]}", flush=True)
+                    except Exception:
+                        pass
+                raise last_exc
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError("unreachable step_env retry state")
 
 
 def get_state(session_id: str) -> Dict[str, Any]:
@@ -439,6 +474,18 @@ def run_episode(model, tokenizer, task: str, seed: int,
     for step_num in range(1, max_steps + 1):
         # F6: stateful delta-prompt instead of full history replay
         prompt = format_stateful_prompt(obs, last_belief, last_action)
+        debug_json("step_input", {
+            "task": task,
+            "seed": seed,
+            "rollout": rollout_idx,
+            "step": step_num,
+            "max_steps": max_steps,
+            "session_id": session_id,
+            "observation": obs,
+            "last_belief": last_belief,
+            "last_action": last_action,
+            "prompt": prompt,
+        })
 
         try:
             raw = generate(model, tokenizer, prompt)
@@ -455,6 +502,18 @@ def run_episode(model, tokenizer, task: str, seed: int,
         action, reasoning, belief, parse_ok = parse_output(
             raw, affected, belief_candidates
         )
+        debug_json("model_output", {
+            "task": task,
+            "seed": seed,
+            "rollout": rollout_idx,
+            "step": step_num,
+            "raw_completion": raw,
+            "belief_candidates": belief_candidates,
+            "parsed_action": action,
+            "parsed_reasoning": reasoning,
+            "parsed_belief": belief,
+            "parse_ok": parse_ok,
+        })
         debug_log(
             f"step task={task} seed={seed} rollout={rollout_idx} "
             f"t={step_num}/{max_steps} candidates={belief_candidates} "
@@ -466,6 +525,17 @@ def run_episode(model, tokenizer, task: str, seed: int,
 
         try:
             next_obs, reward, done = step_env(action, reasoning, session_id)
+            debug_json("env_response", {
+                "task": task,
+                "seed": seed,
+                "rollout": rollout_idx,
+                "step": step_num,
+                "action": action,
+                "reasoning": reasoning,
+                "reward": reward,
+                "done": done,
+                "next_observation": next_obs,
+            })
         except Exception as e:
             print(f"  [EP] step_env failed step {step_num}: {e}")
             break
@@ -491,6 +561,19 @@ def run_episode(model, tokenizer, task: str, seed: int,
         state = get_state(session_id)
         ep.cumulative_reward = float(state.get("cumulative_reward") or local_sum)
         ep.r2_score          = float(state.get("info", {}).get("r2_score", 0.0) or 0.0)
+        debug_json("episode_final_state", {
+            "task": task,
+            "seed": seed,
+            "rollout": rollout_idx,
+            "session_id": session_id,
+            "steps": len(ep.steps),
+            "done": ep.done,
+            "local_reward_sum": local_sum,
+            "state": state,
+            "cumulative_reward": ep.cumulative_reward,
+            "r2_score": ep.r2_score,
+            "parse_rate": ep.parse_rate,
+        })
         debug_log(
             f"episode_state task={task} seed={seed} rollout={rollout_idx} "
             f"steps={len(ep.steps)} done={ep.done} local_sum={local_sum:.4f} "
