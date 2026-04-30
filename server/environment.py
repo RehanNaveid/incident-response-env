@@ -273,11 +273,15 @@ class IncidentResponseEnv(Environment):
 
         # Hypothesis tracking (Task 3)
         if self._task_id == "ambiguous_payment_degradation" and parsed_action == "investigate":
-            if "db" in raw_text:
+            # Match single-word keywords OR the compound phrases the prompt tells the agent to use:
+            # "investigate payment-service db connection"  → db hypothesis
+            # "investigate payment-service rate limit"    → rate hypothesis
+            # "investigate payment-service memory heap"   → memory hypothesis
+            if "db" in raw_text or "connection" in raw_text or "database" in raw_text or "query" in raw_text:
                 self.hypotheses["db"] = True
-            if "rate" in raw_text:
+            if "rate" in raw_text or "stripe" in raw_text or "429" in raw_text or "throttle" in raw_text or "limit" in raw_text:
                 self.hypotheses["rate"] = True
-            if "memory" in raw_text:
+            if "memory" in raw_text or "heap" in raw_text or "oom" in raw_text or "leak" in raw_text or "gc" in raw_text:
                 self.hypotheses["memory"] = True
 
         # 2. Outcome
@@ -778,7 +782,7 @@ class IncidentResponseEnv(Environment):
                 and a.lower().strip() == raw_lower
             )
 
-            return exact_repeats >= 2
+            return exact_repeats >= 4
 
         return False
 
@@ -818,20 +822,24 @@ class IncidentResponseEnv(Environment):
                 1 for a in self._action_history[:-1]
                 if self._parse_action(a.lower()) == "investigate"
             )
-            # Diminishing returns: 0.15, 0.12, 0.09, 0.06, 0.03 (floor 0.02)
-            base = max(0.02, 0.15 - (investigations_done * 0.03))
+            # Diminishing returns: floor at 0.0 (hits 0 after 5 investigations)
+            base = max(0.0, 0.15 - (investigations_done * 0.03))
 
             # Check if investigating an actually affected service
             services = self._incident_data.get("affected_services", [])
             last = (self._last_action or "").lower()
-            
+
             # Use simple substring match — hyphenated names work fine with 'in'
             investigating_affected = any(svc.lower() in last for svc in services)
-            
+
             if investigating_affected:
-                reward = base + 0.10  # correct: 0.25 → 0.12 → ... 
+                reward = base + 0.10  # correct: 0.25 → 0.22 → ... → 0.10 → 0.10
             else:
-                reward = -0.05  # wrong service: flat small penalty, not -0.10
+                reward = -0.05  # wrong service: flat small penalty
+
+            # Escalating pressure after 3rd investigation — agent must progress
+            if investigations_done >= 3:
+                reward -= 0.20 * (investigations_done - 2)  # -0.20, -0.40, -0.60, ...
 
         elif parsed_action == "assign":
             correct_team = self._incident_data.get("correct_team", "").lower()
@@ -853,23 +861,25 @@ class IncidentResponseEnv(Environment):
             if not self._investigated:
                 reward -= 0.30
             elif not mitigation_succeeded:
-                reward -= 0.15
+                # Softer failure penalty — agent must be willing to attempt mitigation
+                reward -= 0.05
             else:
-                reward += 0.03 + (keyword_ratio * 0.10)  # base reduced 0.05->0.03 (R2_WEIGHT raised)
+                # Bigger success reward to reinforce correct mitigation path
+                reward += 0.10 + (keyword_ratio * 0.20)
 
             if self.root_cause_identified:
                 reward += 0.20
 
-            if self.mitigation_attempts > 2:
-                reward -= 0.10 * (self.mitigation_attempts - 2)
+            if self.mitigation_attempts > 5:
+                # Only penalise after 5 mitigation attempts — recovery needs up to 3 re-applies
+                reward -= 0.04 * (self.mitigation_attempts - 5)
 
             if severity_before is not None and severity_after is not None:
                 if severity_after < severity_before:
                     reward += severity_delta
-                if severity_after >= severity_before:
-                    reward -= 0.50
-                elif severity_delta < 0.03:
-                    reward -= 0.20
+                elif severity_delta < 0.03 and mitigation_succeeded:
+                    # Only penalise if it succeeded but barely moved the needle
+                    reward -= 0.10
 
             if self.improvement_streak >= 2:
                 reward += 0.20
@@ -878,12 +888,15 @@ class IncidentResponseEnv(Environment):
             current_severity = severity_after if severity_after is not None else 1.0
 
             if not self._can_resolve():
-                reward -= 0.60  # premature resolve = heavy penalty
+                # Reduced from -0.60 — agent must be willing to try resolve
+                reward -= 0.30
 
             elif current_severity > 0.05:
-                reward -= 0.40  # system not fully healthy
+                # System not fully healthy — reduced penalty so agent still attempts
+                reward -= 0.20
             else:
-                reward += max(0.3, 0.8 - (0.08 * current_step))  # reduced reward
+                # Larger terminal bonus to strongly reinforce the correct resolution path
+                reward += max(0.5, 1.2 - (0.08 * current_step))
 
         else:
             reward -= 0.30
@@ -903,11 +916,20 @@ class IncidentResponseEnv(Environment):
                 and (self._step_count + 1 >= 8 or parsed_action == "resolve")):
             total_hypotheses = 3
             explored = 0
-            if any("db" in a.lower() for a in self._action_history):
+            if any(
+                "db" in a.lower() or "connection" in a.lower() or "database" in a.lower() or "query" in a.lower()
+                for a in self._action_history
+            ):
                 explored += 1
-            if any("rate" in a.lower() for a in self._action_history):
+            if any(
+                "rate" in a.lower() or "stripe" in a.lower() or "429" in a.lower() or "throttle" in a.lower() or "limit" in a.lower()
+                for a in self._action_history
+            ):
                 explored += 1
-            if any("memory" in a.lower() for a in self._action_history):
+            if any(
+                "memory" in a.lower() or "heap" in a.lower() or "oom" in a.lower() or "leak" in a.lower() or "gc" in a.lower()
+                for a in self._action_history
+            ):
                 explored += 1
             remaining = max(0, total_hypotheses - explored)
             reward -= 0.40 * (remaining / total_hypotheses)

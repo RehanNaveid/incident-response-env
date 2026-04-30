@@ -28,7 +28,6 @@ import sys
 from typing import Any, Dict, List, Tuple
 # from dotenv import load_dotenv
 import requests
-from openai import OpenAI
 
 try:
     from dotenv import load_dotenv
@@ -48,6 +47,10 @@ API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://openrouter.ai/api/v1
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "openai/gpt-4o-mini")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860")
+USE_TRAINED_MODEL: bool = os.environ.get("USE_TRAINED_MODEL", "1") == "1"
+
+# Trained LoRA model id on Hugging Face (required when USE_TRAINED_MODEL=1)
+MODEL_ID: str | None = os.environ.get("MODEL_ID")
 
 # Short env name for [START] log line (PS spec requires an identifier, not a URL)
 ENV_NAME: str = "incident_response_env"
@@ -73,6 +76,41 @@ MAX_STEPS = {
     "cascading_failure": 18,
     "ambiguous_payment_degradation": 25,
 }
+
+# ---------------------------------------------------------------------------
+# Load trained model (local, via Unsloth)
+# ---------------------------------------------------------------------------
+
+_model = None
+_tokenizer = None
+
+
+def get_model():
+    global _model, _tokenizer
+    if _model is None:
+        if not MODEL_ID:
+            raise ValueError(
+                "MODEL_ID not set. Set MODEL_ID to your pushed LoRA repo "
+                "(e.g. rehannaveid/incidentiq-lora) once training finishes."
+            )
+        try:
+            from unsloth import FastLanguageModel
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to import `unsloth`. Install it, or run with USE_TRAINED_MODEL=0."
+            ) from e
+
+        print(f"[INFER] Loading {MODEL_ID} ...", flush=True)
+        _model, _tokenizer = FastLanguageModel.from_pretrained(
+            model_name=MODEL_ID,
+            max_seq_length=2048,
+            load_in_4bit=True,
+            dtype=None,
+        )
+        FastLanguageModel.for_inference(_model)
+        print("[INFER] Model ready.", flush=True)
+    return _model, _tokenizer
+
 
 # ---------------------------------------------------------------------------
 # Phase 2 scoring weights
@@ -207,8 +245,15 @@ def _require_env(name: str, value: str) -> str:
 # LLM client builder
 # ---------------------------------------------------------------------------
 
-def _build_client() -> OpenAI:
+def _build_client():
     """Build OpenAI client with provider-specific headers."""
+    try:
+        from openai import OpenAI  # local import so training can import inference.py without openai installed
+    except Exception as e:
+        raise RuntimeError(
+            "OpenAI client not available. Install `openai` or set USE_TRAINED_MODEL=1."
+        ) from e
+
     extra_headers = {}
     if "openrouter" in API_BASE_URL.lower():
         extra_headers = {
@@ -226,8 +271,8 @@ def _build_client() -> OpenAI:
 # LLM helper
 # ---------------------------------------------------------------------------
 
-def ask_llm(
-    client: OpenAI,
+def ask_llm_openai(
+    client,
     observation: Dict[str, Any],
     history: List[Dict],
     action_history: List[str],
@@ -315,11 +360,53 @@ def ask_llm(
         return fallback_action, "", ""
 
 
+def ask_llm_local(
+    observation: Dict[str, Any],
+    action_history: List[str],
+    last_belief: Dict[str, float],
+    last_action: str,
+) -> Tuple[str, str, Dict[str, float]]:
+    """Generate action using trained local model."""
+    # Lazy import: baseline mode should not require torch/unsloth installed.
+    from utils import format_stateful_prompt, generate, parse_output
+
+    model, tokenizer = get_model()
+
+    prompt = format_stateful_prompt(observation, last_belief, last_action)
+
+    try:
+        raw = generate(
+            model,
+            tokenizer,
+            prompt,
+            max_new_tokens=200,
+            temperature=0.7,
+            top_p=0.9,
+        )
+    except Exception as e:
+        print(f"[INFER] generate failed: {e}", flush=True)
+        affected = observation.get("affected_services", ["auth-service"])
+        return f"investigate {affected[0]}", "", {}
+
+    affected = observation.get("affected_services", [])
+    belief_candidates = (
+        observation.get("fan_in_candidates")
+        or observation.get("hypotheses")
+        or affected
+    )
+    action, reasoning, belief, _ = parse_output(raw, affected, belief_candidates)
+    return action, reasoning, belief
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — Training prompt
 # ---------------------------------------------------------------------------
 
-def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
+def format_prompt(
+    observation: Dict[str, Any],
+    history: List[Dict],
+    action_history: List[str] | None = None,
+) -> str:
     """Build the Phase 3 RL training prompt for each step.
 
     Composes a five-section template around the rich observation text
@@ -333,15 +420,19 @@ def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
       - Shows previous steps inline            (sequential reasoning)
 
     Args:
-        observation: Raw observation dict from the environment /step response.
-        history:     Conversation history list (role/content dicts).
+        observation:    Raw observation dict from the environment /step response.
+        history:        Conversation history list (role/content dicts).
+        action_history: Optional list of raw action strings taken so far.
+                        When provided (training), build_prompt uses them for
+                        NEXT hints, hypothesis tracking, and resolve_ready.
+                        When None (inference), defaults to empty list.
 
     Returns:
         Formatted user prompt string.
     """
-    # Reuse the existing rich observation renderer — all task/log/metric
-    # formatting lives there; format_prompt only adds the RL template around it.
-    obs_section = build_prompt(observation, [])   # action hints omitted here
+    # Thread action_history into build_prompt so resolve_ready, hypothesis
+    # checklist, and NEXT directives fire correctly during training rollouts.
+    obs_section = build_prompt(observation, action_history or [])
 
     affected     = observation.get("affected_services", [])
     affected_str = ", ".join(affected) if affected else "(see logs)"
@@ -570,11 +661,13 @@ def build_prompt(
     if task_id == "ambiguous_payment_degradation":
         lines.extend([
             "",
-            "HYPOTHESIS CHECKLIST (investigate after payment-service):",
+            "HYPOTHESIS CHECKLIST — investigate each separately using the EXACT text below:",
         ])
         for action_text, done in hypothesis_statuses:
             status = "DONE" if done else "PENDING"
             lines.append(f"  [{status}] {action_text}")
+        if not all_hypotheses_investigated:
+            lines.append("  !! DO NOT say 'investigate payment-service' — use the EXACT hypothesis text above !!")
 
     lines.extend([
         "",
@@ -635,7 +728,8 @@ def build_prompt(
             "mitigate: <repeat the successful fix>",
         )
         lines.append(
-            f"MITIGATION HAS BEEN APPLIED - do not resolve yet. Re-apply the same mitigation only if the evidence still supports it while LIVE METRICS remain degraded: {last_mitigation}"
+            f"MITIGATION APPLIED BUT METRICS STILL DEGRADED. "
+            f"Your ONLY valid next action is: {last_mitigation}"
         )
     elif mitigation_failed:
         lines.append("YOUR LAST MITIGATION FAILED - do not resolve. Reassess the logs, LIVE METRICS, and your hypothesis before trying another mitigation.")
@@ -652,17 +746,20 @@ def build_prompt(
             lines.append("RESOLVE FAILED - no valid mitigation has been confirmed yet. Apply a mitigation that best fits the evidence.")
     elif "team name not recognized" in feedback_lower:
         lines.append("YOUR LAST TEAM ASSIGNMENT WAS INVALID - retry using EXACTLY one name from TEAM ROSTER.")
+    elif task_id == "ambiguous_payment_degradation" and not all_hypotheses_investigated:
+        pending_hypothesis = next(
+            (action_text for action_text, done in hypothesis_statuses if not done),
+            "investigate payment-service db connection",
+        )
+        lines.append(
+            f"\u26a0\ufe0f MANDATORY NEXT ACTION: {pending_hypothesis}\r\n"
+            f"  (copy-paste this EXACTLY \u2014 do NOT say 'investigate payment-service' without the suffix)"
+        )
     elif ready_to_mitigate:
         lines.append("ALL REQUIRED INVESTIGATIONS ARE COMPLETE - choose the owner from TEAM ROSTER and the mitigation that best fits the evidence.")
     else:
         if remaining:
             lines.append(f"NEXT: investigate {remaining[0]}")
-        elif task_id == "ambiguous_payment_degradation":
-            pending_hypothesis = next(
-                (action_text for action_text, done in hypothesis_statuses if not done),
-                "investigate payment-service db connection",
-            )
-            lines.append(f"NEXT: {pending_hypothesis}")
         else:
             lines.append("ALL SERVICES ARE ALREADY INVESTIGATED - do not investigate further. Assign a team or apply a mitigation.")
 
@@ -773,11 +870,12 @@ def env_step(action: str, reasoning: str = "") -> Dict[str, Any]:
 # Single-task runner
 # ---------------------------------------------------------------------------
 
-def run_task(task_id: str, client: OpenAI, seed: int = FIXED_SEED) -> Dict[str, Any]:
+def run_task(task_id: str, client=None, seed: int = FIXED_SEED) -> Dict[str, Any]:
     max_steps      = MAX_STEPS.get(task_id, 10)
     max_total_reward = MAX_TOTAL_REWARDS.get(task_id, 1.0)
 
-    log_start(task=task_id, model=MODEL_NAME)
+    active_model_name = (MODEL_ID or "MODEL_ID_UNSET") if USE_TRAINED_MODEL else MODEL_NAME
+    log_start(task=task_id, model=active_model_name)
 
     step_num   = 0
     rewards: List[float] = []
@@ -813,22 +911,35 @@ def run_task(task_id: str, client: OpenAI, seed: int = FIXED_SEED) -> Dict[str, 
         done        = reset_resp.get("done", False)
         history: List[Dict] = []
         last_belief_dict: Dict[str, float] = {}
+        last_action: str = ""
 
         # ---- Step loop ----
         while not done and step_num < max_steps:
             step_num += 1
             error: str | None = None
 
-            chosen_action, reasoning_text, raw_response = ask_llm(
-                client, observation, history, action_history,
-            )
+            if USE_TRAINED_MODEL:
+                chosen_action, reasoning_text, belief = ask_llm_local(
+                    observation,
+                    action_history,
+                    last_belief_dict,
+                    last_action,
+                )
+                last_action = chosen_action
+                if belief:
+                    last_belief_dict = belief
+            else:
+                chosen_action, reasoning_text, raw_response = ask_llm_openai(
+                    client, observation, history, action_history,
+                )
+                last_action = chosen_action
 
-            # Parse belief from model's raw response for next-step injection
-            try:
-                parsed_response = json.loads(raw_response) if raw_response else {}
-                last_belief_dict = parsed_response.get("belief", last_belief_dict)
-            except Exception:
-                pass  # keep last known belief
+                # Parse belief from model's raw response for next-step injection
+                try:
+                    parsed_response = json.loads(raw_response) if raw_response else {}
+                    last_belief_dict = parsed_response.get("belief", last_belief_dict)
+                except Exception:
+                    pass  # keep last known belief
 
             if not last_belief_dict:
                 print(f"[WARN] step={step_num} belief parse failed — R2=0 this step", flush=True)
@@ -936,11 +1047,15 @@ def run_task(task_id: str, client: OpenAI, seed: int = FIXED_SEED) -> Dict[str, 
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    _require_env("API_BASE_URL", API_BASE_URL)
-    _require_env("MODEL_NAME", MODEL_NAME)
-    _require_env("HF_TOKEN", HF_TOKEN)
-
-    client = _build_client()
+    client = None
+    if USE_TRAINED_MODEL:
+        # No API keys needed — local model
+        pass
+    else:
+        _require_env("API_BASE_URL", API_BASE_URL)
+        _require_env("MODEL_NAME", MODEL_NAME)
+        _require_env("HF_TOKEN", HF_TOKEN)
+        client = _build_client()
 
     results: List[Dict[str, Any]] = []
     task_ids_override = os.environ.get("TASK_IDS_OVERRIDE", "").strip()

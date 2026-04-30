@@ -364,9 +364,14 @@ class IncidentSimulator:
             return
 
         if mitigate_done and kw_ratio > 0:
-            rate    = 0.40 + kw_ratio * 0.40   # floor raised: 0.25→0.40
-            state.error_rate = max(0.1, state.error_rate * (1.0 - rate) + noise * 0.3)
-            state.saturation = max(0.1, state.saturation * 0.75)
+            # rate = 0.70 + kw_ratio*0.28: floor 0.70, perfect match = 0.98.
+            # 45% * (1 - 0.98) + tiny_noise ≈ 0.9% → clears 5% threshold in 1 step.
+            rate    = 0.70 + kw_ratio * 0.28   # range: [0.70, 0.98]
+            state.error_rate = max(0.1, state.error_rate * (1.0 - rate) + noise * 0.05)
+            state.saturation = max(0.1, state.saturation * 0.60)
+            # Hard clamp: noise cannot push a nearly-recovered service back above threshold
+            if state.error_rate < 6.0:
+                state.error_rate = max(0.1, state.error_rate * 0.50)
         elif action == "investigate":
             growth = state.natural_growth * 0.5
             state.error_rate = min(99.0, state.error_rate * (1.0 + growth) + noise * 0.4)

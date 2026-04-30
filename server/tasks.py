@@ -121,60 +121,68 @@ def _score_reasoning_evolution(reasoning_texts: list[str]) -> float:
 
 
 def grade_task1(action_history: List[str], seed_meta: dict, reasoning_texts=None) -> float:
-    """Grader for **single_service_outage**.
+    """Grader for **single_service_outage** (hackathon sequence-quality grader).
 
-    +0.25  correct team assigned (from seed_meta, not hard-coded)
-    +0.30  correct mitigation keyword used
-    +0.15  investigated before mitigating
-    +0.20  resolved
-    +0.10  efficiency bonus (≤ 6 steps)
+    Rewards the correct investigation → mitigation → resolution sequence,
+    not exact keyword matching.  Keyword bonuses still apply for precision.
+
+    +0.30  investigated the correct affected service
+    +0.30  applied any mitigation action
+    +0.25  resolved the incident
+    +0.15  efficiency bonus (≤ 6 steps)
     """
-    actions = " ".join(action_history).lower()
     score = 0.0
+    actions_lower = [a.lower() for a in action_history]
 
-    # Correct team from incident metadata (not hard-coded "backend")
-    correct_team = seed_meta.get("correct_team", "backend").lower()
-    if any("assign" in a.lower() and correct_team in a.lower() for a in action_history):
-        score += 0.25
-
-    # Mitigation — check against actual valid mitigations from incident
-    valid_mits = seed_meta.get("valid_mitigations", ["restart", "pool", "connection"])
-    mitigation_done = any(
-        "mitigate" in a.lower() and any(kw in a.lower() for kw in valid_mits)
-        for a in action_history
+    # Did agent investigate the correct service?
+    affected = [s.lower() for s in seed_meta.get("affected_services", ["auth-service"])]
+    investigated_correctly = any(
+        "investigate" in a and any(svc in a for svc in affected)
+        for a in actions_lower
     )
-    if mitigation_done:
+    if investigated_correctly:
         score += 0.30
 
-    # Must investigate the actual affected service
-    affected = seed_meta.get("affected_services", ["auth-service"])
-    investigated = any(
-        "investigate" in a.lower() and any(svc.lower() in a.lower() for svc in affected)
-        for a in action_history
+    # Did agent apply ANY mitigation?
+    mitigated = any(
+        "mitigate" in a or "restart" in a or "rollback" in a or "revert" in a
+        or "throttle" in a or "vacuum" in a or "backoff" in a
+        for a in actions_lower
     )
-    if investigated:
+    if mitigated:
+        score += 0.30
+
+    # Did agent resolve?
+    resolved = any("resolve" in a for a in actions_lower)
+    if resolved and mitigated:
+        score += 0.25
+
+    # Efficiency bonus — rewarded when full sequence completed quickly
+    if investigated_correctly and mitigated and resolved and len(action_history) <= 6:
         score += 0.15
 
-    # Resolution
-    if mitigation_done and any("resolve" in a.lower() for a in action_history):
-        score += 0.20
-
-    # Efficiency bonus
-    if investigated and mitigation_done and len(action_history) <= 6:
+    # Keyword precision bonuses (still valuable but not required)
+    correct_team = seed_meta.get("correct_team", "").lower()
+    if correct_team and any(
+        "assign" in a and correct_team in a for a in actions_lower
+    ):
         score += 0.10
 
-    # Runbook usage bonus — reward agents that query available tooling
+    valid_mits = seed_meta.get("valid_mitigations", [])
+    if valid_mits and any(
+        "mitigate" in a and any(kw in a for kw in valid_mits)
+        for a in actions_lower
+    ):
+        score += 0.05
+
+    # Runbook usage bonus
     runbook_queries = seed_meta.get("runbook_queries", [])
     if any(svc in runbook_queries for svc in affected):
         score += 0.05
 
-    # NOTE: _score_reasoning intentionally omitted from live RL grader.
-    # Use eval_score_reasoning() in offline evaluation only.
-
     # Penalize repeated identical mitigations
     mitigate_actions = [a for a in action_history if "mitigate" in a.lower()]
     unique_mitigations = len(set(a.lower() for a in mitigate_actions))
-
     repeat_penalty = max(0, len(mitigate_actions) - unique_mitigations) * 0.08
     score -= repeat_penalty
 

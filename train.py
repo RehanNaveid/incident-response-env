@@ -37,9 +37,9 @@ from trl import GRPOConfig
 
 # ---------------------------------------------------------------------------
 # Reuse existing Phase 3 prompt infrastructure from inference.py
-# ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from inference import format_prompt, SYSTEM_PROMPT  # noqa: E402
+# Import SYSTEM_PROMPT and format_prompt from inference.py so training uses
+# the EXACT same prompt format as evaluation — eliminates train/infer mismatch.
+from inference import SYSTEM_PROMPT, format_prompt
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -101,11 +101,13 @@ FINAL_DIR:      str   = "incidentiq-lora"
 
 # Curriculum
 CURRICULUM: List[List[str]] = [
-    ["single_service_outage"],
-    ["single_service_outage", "ambiguous_payment_degradation"],
-    ["single_service_outage", "cascading_failure"],
+    ["single_service_outage"],                                        # epoch 1: master basics
+    ["single_service_outage", "single_service_outage",
+     "ambiguous_payment_degradation"],                                 # epoch 2: 2:1 ratio (Task 3 delayed)
+    ["single_service_outage", "cascading_failure",
+     "ambiguous_payment_degradation"],                                 # epoch 3: all tasks
 ]
-STEPS_PER_EPOCH: int = int(os.environ.get("STEPS_PER_EPOCH", "15"))
+STEPS_PER_EPOCH: int = int(os.environ.get("STEPS_PER_EPOCH", "25"))
 
 SEEDS: List[int] = [42, 7, 13, 99, 2024, 314]
 
@@ -124,6 +126,19 @@ grpo_config = GRPOConfig(
     logging_steps               = 1,
     report_to                   = "none",
 )
+
+# ---------------------------------------------------------------------------
+# Unified blended reward formula (Issue 4: single definition used everywhere)
+# ---------------------------------------------------------------------------
+
+R1_BLEND_WEIGHT: float = 0.30
+R2_BLEND_WEIGHT: float = 0.70
+R1_SCALE:        float = 5.0
+
+
+def compute_blended(r1: float, r2: float) -> float:
+    """0.30*(R1/5) + 0.70*R2 — single source of truth for trainer_step and dry_run."""
+    return R1_BLEND_WEIGHT * (r1 / R1_SCALE) + R2_BLEND_WEIGHT * r2
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +160,10 @@ class Episode:
     task_id:           str
     seed:              int
     steps:             List[StepRecord] = field(default_factory=list)
-    cumulative_reward: float = 0.0   # server R1 (authoritative)
+    cumulative_reward: float = 0.0   # server R1 (authoritative, may include completion bonus)
+    raw_r1:            float = 0.0   # R1 BEFORE completion bonus — used for blended formula
     r2_score:          float = 0.0   # server R2
-    blended_reward:    float = 0.0   # F2: 0.5*(R1/5) + 0.5*R2  — used by GRPO
+    blended_reward:    float = 0.0   # compute_blended(raw_r1, r2_score) — used by GRPO
     done:              bool  = False
     parse_rate:        float = 1.0
 
@@ -240,7 +256,7 @@ def _hdr(session_id: str) -> Dict[str, str]:
 def reset_env(task: str, seed: int, session_id: str) -> Dict[str, Any]:
     r = requests.post(f"{ENV_URL}/reset",
                       json={"task_id": task, "seed": seed},
-                      headers=_hdr(session_id), timeout=30)
+                      headers=_hdr(session_id), timeout=10)
     r.raise_for_status()
     data = r.json()
     return data.get("observation", data)
@@ -256,7 +272,7 @@ def step_env(action: str, reasoning: str,
                 f"{ENV_URL}/step",
                 json={"action": {"action": action, "reasoning": reasoning}},
                 headers=_hdr(session_id),
-                timeout=30,
+                timeout=10,
             )
             r.raise_for_status()
             d = r.json()
@@ -348,110 +364,17 @@ def parse_output(
     return action, reasoning, belief, True        # parse_ok=True
 
 
-# ---------------------------------------------------------------------------
-# 5.  Rollout — one complete episode
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 5b.  Stateful training prompt  (Fix 6)
-# ---------------------------------------------------------------------------
-
-def format_stateful_prompt(
-    obs:         Dict[str, Any],
-    last_belief: Dict[str, float],
-    last_action: str,
-) -> str:
-    """Focused POMDP-style delta prompt used during RL training rollouts.
-
-    Instead of re-feeding full history (which duplicates feedback and creates
-    noise), shows only the minimal state delta the agent needs to update belief:
-      1. Previous belief  — what it believed before this step
-      2. Result/feedback  — outcome of last action
-      3. New logs/metrics — fresh evidence
-      4. Update directive — explicit instruction to revise belief then act
-
-    This forms a proper belief-update loop (POMDP filter), not stateless
-    guessing.  history duplication eliminated → cleaner belief gradient.
-    """
-    affected     = obs.get("affected_services", [])
-    affected_str = ", ".join(affected) if affected else "(see logs)"
-    feedback     = obs.get("feedback", "") or ""
-    task_id      = obs.get("task_id", "")
-    severity     = obs.get("severity", "")
-    sla          = obs.get("sla_remaining", "?")
-
-    logs_text = "\n".join(
-        f"  {ln}" for ln in obs.get("logs", [])
-    ) or "  (no new logs)"
-
-    metrics_text = "\n".join(
-        f"  {m.get('service','?')}: error={m.get('error_rate_pct','?')}%  "
-        f"latency={m.get('latency_p99_ms','?')}ms  [{m.get('status','?')}]"
-        for m in obs.get("metrics", [])
-        if isinstance(m, dict)
-    ) or "  (no metrics)"
-
-    belief_str  = json.dumps(last_belief, indent=2) if last_belief else "{}"
-    # Belief keys must match what R2 grades against:
-    #   Task 1/2: fan_in_candidates (service names)
-    #   Task 3: hypotheses (db_overload, rate_limit, memory_leak)
-    belief_candidates = (
-        obs.get("fan_in_candidates")
-        or obs.get("hypotheses")
-        or affected
-    )
-    candidate_list = ", ".join(belief_candidates) if belief_candidates else "(none)"
-    belief_keys = ",  ".join(f'"{s}": <probability>' for s in belief_candidates)
-
-    return f"""\
-Task: {task_id}  |  Severity: {severity}  |  SLA remaining: {sla} min
-Affected services: {affected_str}
-
---- PREVIOUS BELIEF ---
-{belief_str}
-
---- RESULT OF LAST ACTION: {last_action or '(first step)'} ---
-{feedback or '(no feedback yet)'}
-
---- NEW LOGS ---
-{logs_text}
-
---- LIVE METRICS ---
-{metrics_text}
-
---- UPDATE YOUR BELIEF AND CHOOSE AN ACTION ---
-
-Using the new evidence above:
-1. Which service is MOST likely the root cause? Update probabilities accordingly.
-2. If you investigated a service and found it healthy, DECREASE its probability significantly.
-3. Choose ONE action: investigate <service> | assign to <team> | mitigate: <fix> | resolve
-
-Belief constraints:
-- Your belief must ONLY contain these keys: {candidate_list}
-- You MUST assign probability to ALL candidates.
-- No extra keys are allowed.
-- Probabilities must sum to 1.0.
-
-Return ONLY valid JSON:
-{{
-  "thought": "evidence analysis citing specific log lines",
-  "belief": {{{belief_keys}}},
-  "action": "one valid action"
-}}
-
-If belief incorrect -> R2 reward reduced.  If action incorrect -> R1 reward reduced.
-Now produce your next step.
-"""
-
-
 def run_episode(model, tokenizer, task: str, seed: int,
                 rollout_idx: int = 0,
                 max_steps: int = MAX_STEPS_EP) -> Episode:
     """Run one full episode, collecting StepRecords.
 
-    Fix 3: unique session_id per rollout (pid + timestamp + rollout_idx).
-    Fix 4: /state cumulative_reward is authoritative; local sum is fallback.
-    Fix 6: uses format_stateful_prompt() for focused belief-update context.
+    Uses format_prompt() from inference.py — identical prompt format to
+    evaluation, eliminating train/inference mismatch.
+
+    History is maintained as role/content dicts (matching inference.py's
+    run_task), and action_history as a plain string list so build_prompt
+    can fire all NEXT hints, resolve_ready, and hypothesis directives.
     """
     ep         = Episode(task_id=task, seed=seed)
     session_id = _make_session_id(rollout_idx)
@@ -466,25 +389,22 @@ def run_episode(model, tokenizer, task: str, seed: int,
         print(f"  [EP] reset failed: {e}")
         return ep
 
-    last_belief: Dict[str, float] = {}
-    last_action: str              = ""
-    parse_hits:  int              = 0
-    parse_total: int              = 0
+    # Conversation history (role/content dicts) — mirrors inference.py run_task()
+    history:        List[Dict]         = []
+    # Plain action strings — passed to build_prompt for NEXT hints / resolve_ready
+    action_history: List[str]          = []
+    last_belief:    Dict[str, float]   = {}
+    parse_hits:     int                = 0
+    parse_total:    int                = 0
 
     for step_num in range(1, max_steps + 1):
-        # F6: stateful delta-prompt instead of full history replay
-        prompt = format_stateful_prompt(obs, last_belief, last_action)
+        # Use identical prompt format as inference.py evaluation
+        prompt = format_prompt(obs, history, action_history=action_history)
         debug_json("step_input", {
-            "task": task,
-            "seed": seed,
-            "rollout": rollout_idx,
-            "step": step_num,
-            "max_steps": max_steps,
-            "session_id": session_id,
-            "observation": obs,
-            "last_belief": last_belief,
-            "last_action": last_action,
-            "prompt": prompt,
+            "task": task, "seed": seed, "rollout": rollout_idx,
+            "step": step_num, "max_steps": max_steps,
+            "session_id": session_id, "observation": obs,
+            "action_history": action_history, "prompt": prompt,
         })
 
         try:
@@ -502,18 +422,6 @@ def run_episode(model, tokenizer, task: str, seed: int,
         action, reasoning, belief, parse_ok = parse_output(
             raw, affected, belief_candidates
         )
-        debug_json("model_output", {
-            "task": task,
-            "seed": seed,
-            "rollout": rollout_idx,
-            "step": step_num,
-            "raw_completion": raw,
-            "belief_candidates": belief_candidates,
-            "parsed_action": action,
-            "parsed_reasoning": reasoning,
-            "parsed_belief": belief,
-            "parse_ok": parse_ok,
-        })
         debug_log(
             f"step task={task} seed={seed} rollout={rollout_idx} "
             f"t={step_num}/{max_steps} candidates={belief_candidates} "
@@ -526,27 +434,48 @@ def run_episode(model, tokenizer, task: str, seed: int,
         try:
             next_obs, reward, done = step_env(action, reasoning, session_id)
             debug_json("env_response", {
-                "task": task,
-                "seed": seed,
-                "rollout": rollout_idx,
-                "step": step_num,
-                "action": action,
-                "reasoning": reasoning,
-                "reward": reward,
-                "done": done,
-                "next_observation": next_obs,
+                "task": task, "seed": seed, "rollout": rollout_idx,
+                "step": step_num, "action": action,
+                "reward": reward, "done": done,
             })
         except Exception as e:
             print(f"  [EP] step_env failed step {step_num}: {e}")
             break
 
+        # Update action_history (used by format_prompt → build_prompt hints)
+        action_history.append(action)
+
+        # Build history entry for next prompt
+        try:
+            history.append({"role": "assistant",
+                            "content": json.dumps({"action": action, "thought": "", "belief": belief})})
+        except Exception:
+            history.append({"role": "assistant", "content": action})
+
+        feedback = next_obs.get("feedback", "")
+        result_summary = f"RESULT OF YOUR LAST ACTION: {feedback} (reward={reward:.2f})"
+        if "Fix applied" in feedback:
+            if "healthy" in feedback.lower() or "you may resolve" in feedback.lower():
+                result_summary += " LIVE METRICS ARE NOW HEALTHY — your next action MUST be: resolve"
+            else:
+                result_summary += " Mitigation applied but services still degraded. Re-apply same mitigation."
+        elif "resolved successfully" in feedback.lower():
+            result_summary += " Incident resolved. Episode complete."
+        elif "Cannot resolve" in feedback:
+            result_summary += " Cannot resolve yet — apply mitigation first."
+        history.append({"role": "user", "content": result_summary})
+
+        # Cap history to last 6 exchanges (12 messages) to prevent token overflow
+        if len(history) > 12:
+            history = history[-12:]
+
+        # Record step for GRPO loss computation
         ep.steps.append(StepRecord(
             prompt=prompt, completion=raw,
             action=action, reasoning=reasoning,
             reward=reward, parse_ok=parse_ok,
         ))
         last_belief = belief
-        last_action = action
         obs         = next_obs
 
         if done:
@@ -561,6 +490,11 @@ def run_episode(model, tokenizer, task: str, seed: int,
         state = get_state(session_id)
         ep.cumulative_reward = float(state.get("cumulative_reward") or local_sum)
         ep.r2_score          = float(state.get("info", {}).get("r2_score", 0.0) or 0.0)
+        # raw_r1 = R1 before any completion bonus (clean signal for blended formula)
+        ep.raw_r1 = ep.cumulative_reward
+        # Floor catastrophic Task 3 reward to prevent poisoning GRPO gradient
+        ep.cumulative_reward = max(ep.cumulative_reward, -3.0)
+        ep.raw_r1            = max(ep.raw_r1,            -3.0)
         debug_json("episode_final_state", {
             "task": task,
             "seed": seed,
@@ -674,10 +608,12 @@ def compute_loss(model, tokenizer,
 # 7.  Checkpoint management
 # ---------------------------------------------------------------------------
 
-def save_ckpt(model, tokenizer, step: int) -> None:
+def save_ckpt(model, tokenizer, optimizer, step: int) -> None:
     path = os.path.join(OUTPUT_DIR, f"step-{step}")
     model.save_pretrained(path)
     tokenizer.save_pretrained(path)
+    # Persist optimizer state so resume restores momentum/variance accumulators
+    torch.save(optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
     print(f"[TRAIN] Checkpoint → {path}")
 
     saved = sorted(
@@ -721,19 +657,23 @@ def trainer_step(model, tokenizer, optimizer,
     # Without this, all subsequent gradient steps compute on a frozen model.
     episodes: List[Episode] = []
     max_steps = get_max_steps(global_step)
+    import random as _random
     try:
         FastLanguageModel.for_inference(model)
         for i in range(NUM_ROLLOUTS):
-            ep = run_episode(model, tokenizer, task, seed_base + i,
+            # Issue 5: collision-resistant seed formula prevents identical rollouts
+            rollout_seed = global_step * 10007 + i * 1009 + _random.randint(0, 999)
+            ep = run_episode(model, tokenizer, task, rollout_seed,
                              rollout_idx=i,
-                             max_steps=max_steps)   # F3: unique session per rollout
-            ep.blended_reward = 0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
+                             max_steps=max_steps)
+            # Issue 1: use raw_r1 (pre-bonus) with unified formula
+            ep.blended_reward = compute_blended(ep.raw_r1, ep.r2_score)
             episodes.append(ep)
             print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
-                  f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
-                  f"blended={ep.blended_reward:.4f}  "
+                  f"R={ep.cumulative_reward:.4f}  raw_r1={ep.raw_r1:.4f}  "
+                  f"r2={ep.r2_score:.4f}  blended={ep.blended_reward:.4f}  "
                   f"steps={len(ep.steps)}/{max_steps}  done={ep.done}  "
-                  f"parse={ep.parse_rate:.0%}")
+                  f"parse={ep.parse_rate:.0%}  seed={rollout_seed}")
     finally:
         FastLanguageModel.for_training(model)
 
@@ -749,11 +689,7 @@ def trainer_step(model, tokenizer, optimizer,
             f"  Run dry_run() to diagnose without updating weights."
         )
 
-    # ---- Blended GRPO reward ----
-    # R1 is divided by 5.0 to keep it roughly on the same scale as R2.
-    # Weight R2 higher during early RL so belief learning dominates.
-    for ep in episodes:
-        ep.blended_reward = 0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
+    # blended_reward already set per-episode above (using raw_r1)
 
     # ---- Advantages + reward-variance guard ----
     rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
@@ -860,7 +796,7 @@ def train(model, tokenizer) -> None:
             )
 
             if global_step % SAVE_STEPS == 0:
-                save_ckpt(model, tokenizer, global_step)
+                save_ckpt(model, tokenizer, optimizer, global_step)
 
     # Final save
     print(f"\n[TRAIN] Saving final model → {FINAL_DIR}")
@@ -868,6 +804,34 @@ def train(model, tokenizer) -> None:
     tokenizer.save_pretrained(FINAL_DIR)
     print(f"[TRAIN] Done. Model at ./{FINAL_DIR}")
 
+    # ---- Push to Hugging Face Hub ----
+    import os
+    from huggingface_hub import login, HfApi
+
+    hf_token = os.environ.get("HF_TOKEN")
+    hf_user  = os.environ.get("HF_USERNAME")
+
+    if hf_token and hf_user:
+        try:
+            login(token=hf_token)
+
+            repo_id = f"{hf_user}/incidentiq-lora"
+            print(f"[TRAIN] Uploading model → {repo_id}")
+
+            api = HfApi()
+            api.upload_folder(
+                folder_path=FINAL_DIR,
+                repo_id=repo_id,
+                repo_type="model",
+                token=hf_token,
+            )
+
+            print(f"[TRAIN] Model live at: https://huggingface.co/{repo_id}")
+
+        except Exception as e:
+            print(f"[ERROR] Upload failed: {e}")
+    else:
+        print("[WARN] HF_TOKEN or HF_USERNAME missing → skipping upload")
 
 # ---------------------------------------------------------------------------
 # 9.  Dry-run  — diagnostics WITHOUT weight updates
@@ -911,9 +875,9 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
               f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
               f"parse={ep.parse_rate:.0%}  steps={len(ep.steps)}")
 
-    # Compute estimated blended reward so dry-run diagnostic mirrors trainer_step().
+    # Compute estimated blended using same formula as trainer_step (Issue 4)
     blended_est = [
-        0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
+        compute_blended(ep.raw_r1, ep.r2_score)
         for ep in eps_collected
     ]
     avg_blended_est = sum(blended_est) / max(len(blended_est), 1)
@@ -981,7 +945,7 @@ def main() -> None:
     # Step 1: diagnostic dry-run (10 episodes, no weight update)
     # Aborts if parse_rate < 70% or prints variance warning.
     # Remove or set n=0 to skip once you trust the setup.
-    dry_run(model, tokenizer, n=10)
+    dry_run(model, tokenizer, n=3)
 
     # Step 2: full curriculum training
     train(model, tokenizer)
