@@ -33,7 +33,7 @@ from server.tasks import TASK_CONFIGS
 # Belief calibration reward weights
 # ---------------------------------------------------------------------------
 
-R2_WEIGHT        = 0.15   # Brier-score calibration contribution per step
+R2_WEIGHT        = 0.40   # cross-entropy calibration per step (raised from 0.15)
 STABILITY_WEIGHT = 0.05   # KL-divergence stability penalty (applied directly)
 
 
@@ -782,7 +782,7 @@ class IncidentResponseEnv(Environment):
             elif not mitigation_succeeded:
                 reward -= 0.15
             else:
-                reward += 0.05 + (keyword_ratio * 0.10)
+                reward += 0.03 + (keyword_ratio * 0.10)  # base reduced 0.05->0.03 (R2_WEIGHT raised)
 
             if self.root_cause_identified:
                 reward += 0.20

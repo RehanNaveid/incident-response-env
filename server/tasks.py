@@ -28,7 +28,16 @@ def _parse_category(action: str) -> str:
     return "other"
 
 
-def _score_reasoning(reasoning_texts: list[str]) -> float:
+def eval_score_reasoning(reasoning_texts: list[str]) -> float:
+    """Offline eval-only reasoning scorer.  NOT called during RL training.
+
+    Removed from live graders (grade_task1/2/3) because keyword matching
+    (db, latency, retry, queue) is trivially exploitable: the model discovers
+    it can prepend those words to every thought and earn free gradient signal
+    without actually improving causal reasoning.
+
+    Call this from an offline eval loop, not from run_grader().
+    """
     if not reasoning_texts:
         return -0.1  # no reasoning penalty
 
@@ -57,6 +66,10 @@ def _score_reasoning(reasoning_texts: list[str]) -> float:
         score -= 0.1
 
     return score
+
+
+# Keep original name as alias so existing eval scripts don't break
+_score_reasoning = eval_score_reasoning
 
 
 def _score_reasoning_evolution(reasoning_texts: list[str]) -> float:
@@ -155,8 +168,8 @@ def grade_task1(action_history: List[str], seed_meta: dict, reasoning_texts=None
     if any(svc in runbook_queries for svc in affected):
         score += 0.05
 
-    if reasoning_texts:
-        score += _score_reasoning(reasoning_texts)
+    # NOTE: _score_reasoning intentionally omitted from live RL grader.
+    # Use eval_score_reasoning() in offline evaluation only.
 
     # Penalize repeated identical mitigations
     mitigate_actions = [a for a in action_history if "mitigate" in a.lower()]
@@ -257,9 +270,8 @@ def grade_task2(action_history: List[str], seed_meta: dict, reasoning_texts=None
             and first_resolve_idx <= first_mit_idx):
         score *= 0.50
 
-    # --- Reasoning bonus ---
-    if reasoning_texts:
-        score += _score_reasoning(reasoning_texts)
+    # NOTE: _score_reasoning intentionally omitted from live RL grader.
+    # Use eval_score_reasoning() in offline evaluation only.
 
     # --- Runbook bonus (0.05) ---
     runbook_queries = seed_meta.get("runbook_queries", [])
@@ -371,23 +383,8 @@ def grade_task3(action_history: List[str], seed_meta: dict, reasoning_texts=None
     # elif hypothesis_count == 1:
     #     score -= 0.05 
 
-    if reasoning_texts:
-        score += _score_reasoning(reasoning_texts)
-
-    if reasoning_texts:
-        text = " ".join(reasoning_texts).lower()
-
-        # Reward correct inference chain
-        if "connection" in text and "db" in text:
-            score += 0.15
-
-        # Penalize blind runbook following
-        if "restart" in text and "db" not in text:
-            score -= 0.1
-
-    if reasoning_texts:
-        evolution_score = _score_reasoning_evolution(reasoning_texts)
-        score += evolution_score
+    # NOTE: _score_reasoning and _score_reasoning_evolution intentionally
+    # omitted from live RL grader.  Use eval_score_reasoning() offline.
 
     score = max(0.0, min(score, 1.0))
     return score

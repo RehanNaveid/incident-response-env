@@ -432,10 +432,9 @@ def run_episode(model, tokenizer, task: str, seed: int,
         print(f"  [EP] get_state failed: {e}")
         ep.cumulative_reward = local_sum
 
-    # F2: normalised blended reward for GRPO
-    # R1 range is roughly [-5, +1]; divide by 5 to map to [-1, +0.2]
-    # R2 range is [0, 1] — equal weight after normalisation
-    ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
+    # NOTE: blended_reward is computed AFTER all episodes in the rollout batch
+    # so that per-batch R1 normalisation (Fix 3) has access to all R1 values.
+    # See trainer_step() where ep.blended_reward is set for each episode.
 
     return ep
 
@@ -463,16 +462,18 @@ def grpo_advantages(episodes: List[Episode]) -> List[float]:
 def compute_loss(model, tokenizer,
                  episodes: List[Episode],
                  advantages: List[float]) -> torch.Tensor:
-    """GRPO policy-gradient loss.
+    """GRPO policy-gradient loss — memory-safe implementation.
 
-    Loss = -E[advantage * log π(completion | prompt)]
-    averaged over all (episode, step) pairs in the batch.
+    Collects per-(episode, step) loss tensors into a Python list and calls
+    torch.stack().mean() once.  This avoids the 48-node accumulation graph
+    that the old in-place total = total + ... pattern creates and never frees
+    between rollouts, which causes T4 OOM after ~3 training steps.
 
+    Loss = -mean[ advantage * NLL(completion | prompt) ]
     Only completion tokens are supervised (prompt tokens masked with -100).
     """
     device = next(model.parameters()).device
-    total  = torch.tensor(0.0, device=device, requires_grad=False)
-    count  = 0
+    losses: List[torch.Tensor] = []
 
     model.train()
     for ep, adv in zip(episodes, advantages):
@@ -498,12 +499,12 @@ def compute_loss(model, tokenizer,
             labels    = torch.full_like(input_ids, -100)
             labels[0, prompt_ids.shape[-1]:] = compl_ids[0]
 
-            out      = model(input_ids=input_ids, labels=labels)
-            nll_loss = out.loss                          # mean NLL on completion
-            total    = total + (-adv_t * nll_loss)
-            count   += 1
+            out = model(input_ids=input_ids, labels=labels)
+            losses.append(-adv_t * out.loss)   # scalar tensor, tracked
 
-    return total / max(count, 1)
+    if not losses:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    return torch.stack(losses).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +577,18 @@ def trainer_step(model, tokenizer, optimizer,
             f"  Run dry_run() to diagnose without updating weights."
         )
 
+    # ---- Fix 3: per-batch R1 normalisation (replaces hardcoded /5.0) ----
+    # R1 (cumulative_reward) scale varies by task; normalising within the
+    # current rollout batch ensures both R1 and R2 have comparable gradient
+    # magnitude regardless of task difficulty or episode length.
+    r1_vals  = [ep.cumulative_reward for ep in episodes]
+    r1_mean  = sum(r1_vals) / max(len(r1_vals), 1)
+    r1_std   = math.sqrt(sum((r - r1_mean) ** 2 for r in r1_vals)
+                         / max(len(r1_vals), 1)) + 1e-6
+    for ep in episodes:
+        r1_norm           = (ep.cumulative_reward - r1_mean) / r1_std
+        ep.blended_reward = 0.6 * r1_norm + 0.4 * ep.r2_score
+
     # ---- Advantages + reward-variance guard ----
     rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
     advantages = grpo_advantages(episodes)
@@ -623,7 +636,9 @@ def train(model, tokenizer) -> None:
         for local in range(1, STEPS_PER_EPOCH + 1):
             global_step += 1
             task      = task_pool[(local - 1) % len(task_pool)]
-            seed_base = SEEDS[(global_step - 1) % len(SEEDS)]
+            # Fix 4: prime-multiplier seed avoids periodic cycling.
+            # Period of global_step * 7 mod 2^31 >> curriculum length.
+            seed_base = SEEDS[0] + global_step * 7
 
             print(f"\n[TRAIN] step={global_step} task={task} seed_base={seed_base}")
             t0      = time.time()
