@@ -743,13 +743,16 @@ def _generate_cascading_failure(
         "fan_in_candidates": candidates,              # all suspects, for belief grader
         "red_herring_services": red_herrings,         # passed to simulator
         "fan_in_dag": {
-            # Only expose agent-visible fields; true_edges stay server-side
-            "nodes":          fan_in_dag["nodes"],
-            "edges":          fan_in_dag["edges"],
-            "root":           fan_in_dag["root"],         # hidden from agent prompt
-            "spurious_edges": fan_in_dag["spurious_edges"],   # stored server-side
-            "missing_edges":  fan_in_dag["missing_edges"],    # stored server-side
-            "true_edges":     fan_in_dag["true_edges"],       # stored server-side
+            # Agent-visible only: observable topology without ground truth
+            "nodes": fan_in_dag["nodes"],
+            "edges": fan_in_dag["edges"],   # noisy: 10-20% missing, 20-30% spurious
+        },
+        "_fan_in_dag_ground_truth": {
+            # Server-only: never sent to /incident-meta; exposed to grader via /state
+            "root":          fan_in_dag["root"],
+            "true_edges":    fan_in_dag["true_edges"],
+            "spurious_edges": fan_in_dag["spurious_edges"],
+            "missing_edges":  fan_in_dag["missing_edges"],
         },
         "logs": logs,
         "correct_team": blueprint["correct_team"],

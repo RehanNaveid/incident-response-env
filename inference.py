@@ -324,15 +324,22 @@ def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
     affected     = observation.get("affected_services", [])
     affected_str = ", ".join(affected) if affected else "(see logs)"
 
-    # Render last 4 exchanges from history (8 messages) as compact text
+    # Render last 4 exchanges as compact text.
+    # Assistant turns: extract only the action field so the model sees clean
+    # history without malformed mid-truncated JSON.
+    # User (env) turns: first 200 chars is enough for feedback context.
     history_lines: List[str] = []
     for msg in history:
         role    = msg.get("role", "")
-        content = (msg.get("content") or "")[:300]
-        if role == "user":
-            history_lines.append(f"[ENV] {content}")
-        elif role == "assistant":
-            history_lines.append(f"[YOU] {content}")
+        content = msg.get("content") or ""
+        if role == "assistant":
+            try:
+                parsed = json.loads(content)
+                history_lines.append(f"[YOU] action: {parsed.get('action', '?')}")
+            except Exception:
+                history_lines.append(f"[YOU] {content[:120]}")
+        elif role == "user":
+            history_lines.append(f"[ENV] {content[:200]}")
     history_text = (
         "\n".join(history_lines[-8:])
         if history_lines

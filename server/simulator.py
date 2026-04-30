@@ -24,18 +24,22 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # ---------------------------------------------------------------------------
 
 DOWNSTREAM: Dict[str, List[str]] = {
-    "auth-service":      ["api-gateway", "user-service"],
-    "user-service":      ["api-gateway", "order-service"],
-    "api-gateway":       [],
-    "payment-service":   ["order-service"],
-    "notification-svc":  [],
-    "search-service":    [],
-    "order-service":     [],
-    "reporting-service": [],
-    "config-service":    ["auth-service", "api-gateway", "payment-service"],
-    "db-primary":        ["auth-service", "user-service", "order-service", "payment-service"],
-    "cache-cluster":     ["api-gateway", "user-service", "search-service"],
-    "worker-pool":       ["notification-svc", "reporting-service"],
+    "auth-service":           ["api-gateway", "user-service"],
+    "user-service":           ["api-gateway", "order-service"],
+    "api-gateway":            [],
+    "payment-service":        ["order-service"],
+    "notification-svc":       [],
+    "search-service":         [],
+    "order-service":          [],
+    "reporting-service":      [],
+    "config-service":         ["auth-service", "api-gateway", "payment-service"],
+    "db-primary":             ["auth-service", "user-service", "order-service", "payment-service"],
+    "cache-cluster":          ["api-gateway", "user-service", "search-service"],
+    "worker-pool":            ["notification-svc", "reporting-service"],
+    # Services referenced in _CASCADE_BLUEPRINTS but previously absent:
+    "queue-worker":           ["notification-svc"],           # payment_rate_limit blueprint
+    "recommendation-service": ["api-gateway"],                # search_index_fault blueprint
+    "indexer":                ["search-service"],             # search_index_fault blueprint
 }
 
 # Upstream view: who do I depend on?
@@ -425,9 +429,19 @@ class IncidentSimulator:
 
     @property
     def severity_score(self) -> float:
+        """Max error rate across AFFECTED services only.
+
+        Using all _states (including bystanders) caused false positives:
+        a bystander creeping above 5% under cascade propagation made
+        severity_after > severity_before after a correct mitigation,
+        triggering the -0.50 'severity got worse' penalty for a good action.
+        """
         if not self._states:
             return 0.0
-        return max(s.error_rate for s in self._states.values()) / 100.0
+        affected = [s for s in self._states.values() if s.is_affected]
+        if not affected:
+            return 0.0
+        return max(s.error_rate for s in affected) / 100.0
 
     def snapshot(self) -> Dict[str, Any]:
         return {

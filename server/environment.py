@@ -443,7 +443,10 @@ class IncidentResponseEnv(Environment):
             info["last_reported_belief"] = self._last_reported_belief
             info["fan_in_candidates"] = self._incident_data.get("fan_in_candidates", [])
             info["red_herring_services"] = self._incident_data.get("red_herring_services", [])
+            # Agent-visible topology (nodes + noisy edges only)
             info["fan_in_dag"] = self._incident_data.get("fan_in_dag", {})
+            # Grader-only ground truth (root, true/spurious/missing edges)
+            info["fan_in_dag_ground_truth"] = self._incident_data.get("_fan_in_dag_ground_truth", {})
             # R2 calibration score over full belief trajectory
             info["r2_score"] = self._compute_r2_reward()
             info["belief_xent_per_step"] = [
