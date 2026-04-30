@@ -46,6 +46,12 @@ from inference import format_prompt, SYSTEM_PROMPT  # noqa: E402
 # ---------------------------------------------------------------------------
 
 ENV_URL:      str  = os.environ.get("ENV_URL", "https://your-env.hf.space")
+IR_DEBUG:     bool = os.environ.get("IR_DEBUG", "0") == "1"
+
+
+def debug_log(message: str) -> None:
+    if IR_DEBUG:
+        print(f"[DBG] {message}", flush=True)
 
 # Model
 MODEL_ID:       str  = "unsloth/Qwen2.5-7B-Instruct"
@@ -352,14 +358,14 @@ def format_stateful_prompt(
 
     belief_str  = json.dumps(last_belief, indent=2) if last_belief else "{}"
     # Belief keys must match what R2 grades against:
-    #   Task 2: fan_in_candidates (service names)
+    #   Task 1/2: fan_in_candidates (service names)
     #   Task 3: hypotheses (db_overload, rate_limit, memory_leak)
-    #   Task 1: affected_services (single service, R2 is trivial)
     belief_candidates = (
         obs.get("fan_in_candidates")
         or obs.get("hypotheses")
         or affected
     )
+    candidate_list = ", ".join(belief_candidates) if belief_candidates else "(none)"
     belief_keys = ",  ".join(f'"{s}": <probability>' for s in belief_candidates)
 
     return f"""\
@@ -385,6 +391,12 @@ Using the new evidence above:
 2. If you investigated a service and found it healthy, DECREASE its probability significantly.
 3. Choose ONE action: investigate <service> | assign to <team> | mitigate: <fix> | resolve
 
+Belief constraints:
+- Your belief must ONLY contain these keys: {candidate_list}
+- You MUST assign probability to ALL candidates.
+- No extra keys are allowed.
+- Probabilities must sum to 1.0.
+
 Return ONLY valid JSON:
 {{
   "thought": "evidence analysis citing specific log lines",
@@ -408,6 +420,10 @@ def run_episode(model, tokenizer, task: str, seed: int,
     """
     ep         = Episode(task_id=task, seed=seed)
     session_id = _make_session_id(rollout_idx)
+    debug_log(
+        f"episode_start task={task} seed={seed} rollout={rollout_idx} "
+        f"session={session_id} max_steps={max_steps}"
+    )
 
     try:
         obs = reset_env(task, seed, session_id)
@@ -438,6 +454,11 @@ def run_episode(model, tokenizer, task: str, seed: int,
         )
         action, reasoning, belief, parse_ok = parse_output(
             raw, affected, belief_candidates
+        )
+        debug_log(
+            f"step task={task} seed={seed} rollout={rollout_idx} "
+            f"t={step_num}/{max_steps} candidates={belief_candidates} "
+            f"belief={belief} action={action!r} parse_ok={parse_ok}"
         )
         parse_total += 1
         if parse_ok:
@@ -470,6 +491,11 @@ def run_episode(model, tokenizer, task: str, seed: int,
         state = get_state(session_id)
         ep.cumulative_reward = float(state.get("cumulative_reward") or local_sum)
         ep.r2_score          = float(state.get("info", {}).get("r2_score", 0.0) or 0.0)
+        debug_log(
+            f"episode_state task={task} seed={seed} rollout={rollout_idx} "
+            f"steps={len(ep.steps)} done={ep.done} local_sum={local_sum:.4f} "
+            f"state_reward={ep.cumulative_reward:.4f} r2={ep.r2_score:.4f}"
+        )
     except Exception as e:
         print(f"  [EP] get_state failed: {e}")
         ep.cumulative_reward = local_sum
@@ -488,8 +514,8 @@ def run_episode(model, tokenizer, task: str, seed: int,
 def grpo_advantages(episodes: List[Episode]) -> List[float]:
     """Normalise blended episode rewards within the group (GRPO §3.1).
 
-    Uses ep.blended_reward = 0.5*(R1/5) + 0.5*R2 so both task accuracy
-    and belief calibration contribute equally to the policy gradient.
+    Uses ep.blended_reward = 0.3*(R1/5) + 0.7*R2 to bias early
+    optimisation toward belief calibration.
 
     advantage_i = (blended_i - mean) / (std + eps)
     """
@@ -618,7 +644,7 @@ def trainer_step(model, tokenizer, optimizer,
             ep = run_episode(model, tokenizer, task, seed_base + i,
                              rollout_idx=i,
                              max_steps=max_steps)   # F3: unique session per rollout
-            ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
+            ep.blended_reward = 0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
             episodes.append(ep)
             print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
                   f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
@@ -641,10 +667,10 @@ def trainer_step(model, tokenizer, optimizer,
         )
 
     # ---- Blended GRPO reward ----
-    # R1 is the environment cumulative reward; divide by 5.0 to keep it on
-    # roughly the same scale as R2.  R2 is the server-computed belief score.
+    # R1 is divided by 5.0 to keep it roughly on the same scale as R2.
+    # Weight R2 higher during early RL so belief learning dominates.
     for ep in episodes:
-        ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
+        ep.blended_reward = 0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
 
     # ---- Advantages + reward-variance guard ----
     rewards   = [ep.blended_reward for ep in episodes]   # F2: blended signal
@@ -773,7 +799,7 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
 
     # Compute estimated blended reward so dry-run diagnostic mirrors trainer_step().
     blended_est = [
-        0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
+        0.3 * (ep.cumulative_reward / 5.0) + 0.7 * ep.r2_score
         for ep in eps_collected
     ]
     avg_blended_est = sum(blended_est) / max(len(blended_est), 1)
@@ -794,7 +820,7 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
     print(f"  reward_std       : {std_r:.4f}  {'✓ OK' if std_r >= _MIN_REWARD_STD else '✗ LOW — GRPO will be weak'}")
     print(f"  avg_parse_rate   : {avg_p:.1%}  {'✓ OK' if avg_p >= _MIN_PARSE_RATE else '✗ LOW — R2 cannot learn'}")
     print(f"  avg_r2           : {avg_r2:.4f}")
-    print(f"  avg_blended(est) : {avg_blended_est:.4f}  (0.5*(R1/5) + 0.5*R2)")
+    print(f"  avg_blended(est) : {avg_blended_est:.4f}  (0.3*(R1/5) + 0.7*R2)")
     print("[DRY-RUN] ────────────────────────────────────────────────────────")
 
     if avg_p < _MIN_PARSE_RATE:

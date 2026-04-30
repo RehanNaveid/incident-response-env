@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, ".")
 
 from server.environment import IncidentResponseEnv
+from server.incidents import generate_incident
 
 
 def check(cond: bool, msg: str) -> None:
@@ -36,3 +37,16 @@ env._belief_trajectory = [
 ]
 
 check(env._compute_r2_reward() > 0.0, "task 3 R2 grades hypotheses")
+
+task1 = generate_incident("single_service_outage", 42)
+check(task1.get("root_cause_service") in task1.get("fan_in_candidates", []),
+      "task 1 root is in fan-in candidates")
+
+env1 = IncidentResponseEnv()
+env1._task_id = "single_service_outage"
+env1._incident_data = task1
+env1._step_count = 1
+env1._belief_trajectory = [
+    {task1["root_cause_service"]: 1.0},
+]
+check(env1._compute_r2_reward() > 0.0, "task 1 R2 has non-trivial candidates")

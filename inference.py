@@ -369,12 +369,13 @@ def format_prompt(observation: Dict[str, Any], history: List[Dict]) -> str:
     )
 
     # Belief keys must match what R2 grades against:
-    #   Task 2: fan_in_candidates    Task 3: hypotheses    Task 1: affected_services
+    #   Task 1/2: fan_in_candidates    Task 3: hypotheses
     belief_candidates = (
         observation.get("fan_in_candidates")
         or observation.get("hypotheses")
         or affected
     )
+    candidate_list = ", ".join(belief_candidates) if belief_candidates else "(none)"
     belief_keys = ",  ".join(f'"{s}": <probability>' for s in belief_candidates)
 
     return f"""\
@@ -403,6 +404,9 @@ STEP 1 — ANALYZE
 
 STEP 2 — UPDATE BELIEF
 - Maintain a probability distribution over the belief keys shown in the JSON template
+- Your belief must ONLY contain these keys: {candidate_list}
+- You MUST assign probability to ALL candidates
+- No extra keys are allowed
 - Belief values must sum to approximately 1.0
 - Increase probability for a service when evidence implicates it
 - Decrease probability when investigation shows the service is healthy
@@ -439,6 +443,7 @@ CRITICAL CONSTRAINTS
 =====================
 
 - belief MUST be a valid probability distribution (values sum to ~1.0)
+- belief MUST include every listed belief key and no other keys
 - belief MUST change based on new evidence each step
 - thought MUST cite specific log lines as evidence
 - do NOT output text outside the JSON block

@@ -16,6 +16,7 @@ Data flow (Fix 8):
 
 from __future__ import annotations
 
+import os
 import random
 import re
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,13 @@ from server.tasks import TASK_CONFIGS
 R2_WEIGHT        = 0.40   # cross-entropy calibration per step (raised from 0.15)
 STABILITY_WEIGHT = 0.05   # KL-divergence stability penalty (applied directly)
 STEP_COST        = 0.05   # small pressure to resolve efficiently
+TERMINAL_SUCCESS_BONUS = 1.00
+IR_DEBUG         = os.environ.get("IR_DEBUG", "0") == "1"
+
+
+def _debug(message: str) -> None:
+    if IR_DEBUG:
+        print(f"[DBG] {message}", flush=True)
 
 
 # Canonical action categories returned by _parse_action
@@ -238,6 +246,20 @@ class IncidentResponseEnv(Environment):
                 )
         # If None: no belief this step — calibration rewards stay 0.0
 
+            _debug(
+                "r2 "
+                f"task={self._task_id} step={self._step_count + 1} "
+                f"root={_rc!r} candidates={_cands} "
+                f"belief={parsed_belief} xent={step_r2_reward:.4f} "
+                f"stability={step_stability_reward:.4f}"
+            )
+        else:
+            _debug(
+                "r2 "
+                f"task={self._task_id} step={self._step_count + 1} "
+                "belief_parse=None xent=0.0000"
+            )
+
         # 1. Parse
         parsed_action = self._parse_action(raw_text)
 
@@ -320,6 +342,7 @@ class IncidentResponseEnv(Environment):
             severity_before=severity_before,
             severity_after=severity_after,
         )
+        base_step_reward = step_reward
 
         # Calibration reward: R2 (cross-entropy) + stability (KL penalty)
         # step_r2_reward in [0.0, 1.0] → scaled by R2_WEIGHT
@@ -333,6 +356,12 @@ class IncidentResponseEnv(Environment):
 
         if parsed_action == "resolve" and self._can_resolve():
             self._resolved = True
+            step_reward = max(-1.0, min(2.0, step_reward + TERMINAL_SUCCESS_BONUS))
+            _debug(
+                "terminal "
+                f"task={self._task_id} step={self._step_count} "
+                f"bonus={TERMINAL_SUCCESS_BONUS:.2f} reward={step_reward:.4f}"
+            )
 
         # Better feedback so model knows what to do next
         if parsed_action == "mitigate" and mitigation_succeeded:
@@ -373,6 +402,15 @@ class IncidentResponseEnv(Environment):
 
         # Add final reward to cumulative (SLA decay is already in _compute_step_reward)
         self._cumulative_reward += step_reward
+        _debug(
+            "reward "
+            f"task={self._task_id} step={self._step_count} "
+            f"action={parsed_action} raw_action={action.action!r} "
+            f"base={base_step_reward:.4f} r2_add={(R2_WEIGHT * step_r2_reward):.4f} "
+            f"stability={step_stability_reward:.4f} final={step_reward:.4f} "
+            f"cumulative={self._cumulative_reward:.4f} "
+            f"mitigation_succeeded={mitigation_succeeded} can_resolve={self._can_resolve()}"
+        )
 
         # --- Termination logic ---
         task_config = TASK_CONFIGS.get(self._task_id, {})

@@ -443,11 +443,17 @@ def _generate_single_service_outage(
         _select_blueprint_index(seed, len(_SINGLE_SERVICE_BLUEPRINTS), 0x15)
     ]
     logs = _single_service_logs(blueprint, base_epoch, rng)
+    service = blueprint["service"]
+    candidates = list(dict.fromkeys(
+        [service] + [svc for svc in blueprint["team_map"].keys() if svc != service]
+    ))
 
     return {
         "title": blueprint["title"],
         "severity": blueprint["severity"],
         "affected_services": [blueprint["service"]],
+        "root_cause_service": service,
+        "fan_in_candidates": candidates,
         "logs": logs,
         "correct_team": blueprint["correct_team"],
         "team_map": dict(blueprint["team_map"]),
