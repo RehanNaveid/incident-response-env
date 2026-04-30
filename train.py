@@ -54,24 +54,24 @@ def debug_log(message: str) -> None:
         print(f"[DBG] {message}", flush=True)
 
 # Model
-MODEL_ID:       str  = "unsloth/Qwen2.5-7B-Instruct"
-MAX_SEQ_LEN:    int  = 4096
+MODEL_ID:       str  = os.environ.get("MODEL_ID", "unsloth/Qwen2.5-3B-Instruct")
+MAX_SEQ_LEN:    int  = int(os.environ.get("MAX_SEQ_LEN", "2048"))
 LOAD_IN_4BIT:   bool = True
 
 # LoRA
-LORA_R:         int  = 16
-LORA_ALPHA:     int  = 32
-LORA_DROPOUT:   float = 0.05
+LORA_R:         int  = int(os.environ.get("LORA_R", "8"))
+LORA_ALPHA:     int  = int(os.environ.get("LORA_ALPHA", "16"))
+LORA_DROPOUT:   float = float(os.environ.get("LORA_DROPOUT", "0.0"))
 TARGET_MODULES: List[str] = ["q_proj", "v_proj"]
 
 # Generation  (0.7–0.9 range for exploration)
 TEMPERATURE:    float = 0.8
 TOP_P:          float = 0.9
-MAX_NEW_TOKENS: int   = 320   # F5: enough for JSON belief; ~20% cheaper than 400
+MAX_NEW_TOKENS: int   = int(os.environ.get("MAX_NEW_TOKENS", "256"))
 
 # GRPO
-NUM_ROLLOUTS:   int   = 6        # rollouts per training step (6–8)
-MAX_STEPS_EP:   int   = 8        # initial hard budget per episode
+NUM_ROLLOUTS:   int   = int(os.environ.get("NUM_ROLLOUTS", "3"))
+MAX_STEPS_EP:   int   = int(os.environ.get("MAX_STEPS_EP", "6"))
 LR:             float = 3e-5
 BETA:           float = 0.01     # KL coefficient (set 0 to disable)
 
@@ -79,14 +79,14 @@ BETA:           float = 0.01     # KL coefficient (set 0 to disable)
 def get_max_steps(global_step: int) -> int:
     """Curriculum schedule for the episode horizon."""
     if global_step < 40:
-        return 8
+        return MAX_STEPS_EP
     if global_step < 80:
-        return 10
-    return 12
+        return MAX_STEPS_EP + 2
+    return MAX_STEPS_EP + 4
 
 # Checkpointing
 OUTPUT_DIR:     str   = "./checkpoints"
-SAVE_STEPS:     int   = 25
+SAVE_STEPS:     int   = int(os.environ.get("SAVE_STEPS", "5"))
 SAVE_TOTAL:     int   = 3
 FINAL_DIR:      str   = "incidentiq-lora"
 
@@ -96,7 +96,7 @@ CURRICULUM: List[List[str]] = [
     ["single_service_outage", "cascading_failure"],
     ["single_service_outage", "cascading_failure", "ambiguous_payment_degradation"],
 ]
-STEPS_PER_EPOCH: int = 50
+STEPS_PER_EPOCH: int = int(os.environ.get("STEPS_PER_EPOCH", "10"))
 
 SEEDS: List[int] = [42, 7, 13, 99, 2024, 314]
 
@@ -148,7 +148,7 @@ class Episode:
 # ---------------------------------------------------------------------------
 
 def load_model() -> Tuple[Any, Any]:
-    """Load Qwen2.5-7B-Instruct with Unsloth 4-bit + LoRA."""
+    """Load the configured Qwen2.5-Instruct model with Unsloth 4-bit + LoRA."""
     print(f"[TRAIN] Loading {MODEL_ID} (4-bit) …")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name     = MODEL_ID,
@@ -875,7 +875,8 @@ def main() -> None:
     print(f"[TRAIN] LoRA           = r={LORA_R}  alpha={LORA_ALPHA}  "
           f"targets={TARGET_MODULES}")
     print(f"[TRAIN] GRPO           = rollouts={NUM_ROLLOUTS}  "
-          f"max_steps_ep=8/10/12  lr={LR}  beta={BETA}")
+          f"max_steps_ep={MAX_STEPS_EP}/{MAX_STEPS_EP + 2}/{MAX_STEPS_EP + 4}  "
+          f"max_new_tokens={MAX_NEW_TOKENS}  lr={LR}  beta={BETA}")
     print(f"[TRAIN] Curriculum     = {len(CURRICULUM)} epochs × "
           f"{STEPS_PER_EPOCH} steps")
     print(f"[TRAIN] Checkpoints    = {OUTPUT_DIR}  "
