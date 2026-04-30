@@ -691,11 +691,42 @@ def trainer_step(model, tokenizer, optimizer,
 
     # ---- Update ----
     FastLanguageModel.for_training(model)
+    update_t0 = time.time()
+    print(f"[TRAIN] step={global_step} update_start rollouts={len(episodes)}", flush=True)
+
     optimizer.zero_grad()
+    loss_t0 = time.time()
+    print(f"[TRAIN] step={global_step} loss_start", flush=True)
     loss = compute_loss(model, tokenizer, episodes, advantages)
+    loss_elapsed = time.time() - loss_t0
+    print(
+        f"[TRAIN] step={global_step} loss_done "
+        f"loss={loss.item():.6f} elapsed={loss_elapsed:.1f}s",
+        flush=True,
+    )
+
+    backward_t0 = time.time()
+    print(f"[TRAIN] step={global_step} backward_start", flush=True)
     loss.backward()
+    backward_elapsed = time.time() - backward_t0
+    print(
+        f"[TRAIN] step={global_step} backward_done elapsed={backward_elapsed:.1f}s",
+        flush=True,
+    )
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    opt_t0 = time.time()
+    print(f"[TRAIN] step={global_step} optimizer_start", flush=True)
     optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    opt_elapsed = time.time() - opt_t0
+    update_elapsed = time.time() - update_t0
+    print(
+        f"[TRAIN] step={global_step} completed "
+        f"loss={loss.item():.6f} update_elapsed={update_elapsed:.1f}s "
+        f"optimizer_elapsed={opt_elapsed:.1f}s",
+        flush=True,
+    )
 
     return {
         "loss":           loss.item(),
