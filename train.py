@@ -65,9 +65,18 @@ MAX_NEW_TOKENS: int   = 320   # F5: enough for JSON belief; ~20% cheaper than 40
 
 # GRPO
 NUM_ROLLOUTS:   int   = 6        # rollouts per training step (6–8)
-MAX_STEPS_EP:   int   = 8        # hard budget per episode (6–10)
+MAX_STEPS_EP:   int   = 8        # initial hard budget per episode
 LR:             float = 3e-5
 BETA:           float = 0.01     # KL coefficient (set 0 to disable)
+
+
+def get_max_steps(global_step: int) -> int:
+    """Curriculum schedule for the episode horizon."""
+    if global_step < 40:
+        return 8
+    if global_step < 80:
+        return 10
+    return 12
 
 # Checkpointing
 OUTPUT_DIR:     str   = "./checkpoints"
@@ -389,7 +398,8 @@ Now produce your next step.
 
 
 def run_episode(model, tokenizer, task: str, seed: int,
-                rollout_idx: int = 0) -> Episode:
+                rollout_idx: int = 0,
+                max_steps: int = MAX_STEPS_EP) -> Episode:
     """Run one full episode, collecting StepRecords.
 
     Fix 3: unique session_id per rollout (pid + timestamp + rollout_idx).
@@ -410,7 +420,7 @@ def run_episode(model, tokenizer, task: str, seed: int,
     parse_hits:  int              = 0
     parse_total: int              = 0
 
-    for step_num in range(1, MAX_STEPS_EP + 1):
+    for step_num in range(1, max_steps + 1):
         # F6: stateful delta-prompt instead of full history replay
         prompt = format_stateful_prompt(obs, last_belief, last_action)
 
@@ -601,17 +611,19 @@ def trainer_step(model, tokenizer, optimizer,
     # run_episode raises mid-rollout (env timeout, JSON crash, etc.).
     # Without this, all subsequent gradient steps compute on a frozen model.
     episodes: List[Episode] = []
+    max_steps = get_max_steps(global_step)
     try:
         FastLanguageModel.for_inference(model)
         for i in range(NUM_ROLLOUTS):
             ep = run_episode(model, tokenizer, task, seed_base + i,
-                             rollout_idx=i)   # F3: unique session per rollout
+                             rollout_idx=i,
+                             max_steps=max_steps)   # F3: unique session per rollout
             ep.blended_reward = 0.5 * (ep.cumulative_reward / 5.0) + 0.5 * ep.r2_score
             episodes.append(ep)
             print(f"  rollout {i+1}/{NUM_ROLLOUTS}  "
                   f"R={ep.cumulative_reward:.4f}  r2={ep.r2_score:.4f}  "
                   f"blended={ep.blended_reward:.4f}  "
-                  f"steps={len(ep.steps)}  done={ep.done}  "
+                  f"steps={len(ep.steps)}/{max_steps}  done={ep.done}  "
                   f"parse={ep.parse_rate:.0%}")
     finally:
         FastLanguageModel.for_training(model)
@@ -640,6 +652,7 @@ def trainer_step(model, tokenizer, optimizer,
     avg_r   = sum(ep.cumulative_reward for ep in episodes) / max(len(episodes), 1)
     avg_r2  = sum(ep.r2_score          for ep in episodes) / max(len(episodes), 1)
     avg_bl  = sum(ep.blended_reward    for ep in episodes) / max(len(episodes), 1)
+    avg_steps = sum(len(ep.steps) for ep in episodes) / max(len(episodes), 1)
     std_r   = math.sqrt(sum((r - sum(rewards)/max(len(rewards),1)) ** 2
                             for r in rewards) / max(len(rewards), 1))
     best    = max(episodes, key=lambda e: e.cumulative_reward)
@@ -663,6 +676,8 @@ def trainer_step(model, tokenizer, optimizer,
         "avg_reward":     avg_r,
         "avg_r2":         avg_r2,
         "avg_blended":    avg_bl,
+        "avg_steps":      avg_steps,
+        "max_steps_ep":   max_steps,
         "reward_std":     std_r,
         "parse_rate":     avg_parse,
         "sample":         sample,
@@ -697,6 +712,7 @@ def train(model, tokenizer) -> None:
                 f"avg_reward={metrics['avg_reward']:.4f}  "
                 f"avg_r2={metrics['avg_r2']:.4f}  "
                 f"avg_blended={metrics['avg_blended']:.4f}  "
+                f"avg_steps={metrics['avg_steps']:.2f}/{metrics['max_steps_ep']}  "
                 f"reward_std={metrics['reward_std']:.4f}  "
                 f"parse_rate={metrics['parse_rate']:.0%}  "
                 f"sample_action={metrics['sample']!r}  "
@@ -729,7 +745,8 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
         model, tok = load_model()
         dry_run(model, tok, n=10)
     """
-    print(f"\n[DRY-RUN] Running {n} diagnostic episodes (no weight update) …")
+    max_steps = get_max_steps(0)
+    print(f"\n[DRY-RUN] Running {n} diagnostic episodes (no weight update, max_steps={max_steps}) …")
     FastLanguageModel.for_inference(model)
 
     tasks  = CURRICULUM[-1]    # use full task pool for worst-case coverage
@@ -739,7 +756,7 @@ def dry_run(model, tokenizer, n: int = 10) -> None:
     for i in range(n):
         task = tasks[i % len(tasks)]
         seed = SEEDS[i % len(SEEDS)] + 1000   # distinct from training seeds
-        ep   = run_episode(model, tokenizer, task, seed)
+        ep   = run_episode(model, tokenizer, task, seed, max_steps=max_steps)
         eps_collected.append(ep)
         rows.append({
             "ep":     i + 1,
@@ -801,7 +818,7 @@ def main() -> None:
     print(f"[TRAIN] LoRA           = r={LORA_R}  alpha={LORA_ALPHA}  "
           f"targets={TARGET_MODULES}")
     print(f"[TRAIN] GRPO           = rollouts={NUM_ROLLOUTS}  "
-          f"max_steps_ep={MAX_STEPS_EP}  lr={LR}  beta={BETA}")
+          f"max_steps_ep=8/10/12  lr={LR}  beta={BETA}")
     print(f"[TRAIN] Curriculum     = {len(CURRICULUM)} epochs × "
           f"{STEPS_PER_EPOCH} steps")
     print(f"[TRAIN] Checkpoints    = {OUTPUT_DIR}  "

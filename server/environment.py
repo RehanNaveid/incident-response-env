@@ -35,6 +35,7 @@ from server.tasks import TASK_CONFIGS
 
 R2_WEIGHT        = 0.40   # cross-entropy calibration per step (raised from 0.15)
 STABILITY_WEIGHT = 0.05   # KL-divergence stability penalty (applied directly)
+STEP_COST        = 0.05   # small pressure to resolve efficiently
 
 
 # Canonical action categories returned by _parse_action
@@ -883,6 +884,8 @@ class IncidentResponseEnv(Environment):
         sla_fraction = min(1.0, time_used / max(sla_minutes, 1))
         if sla_fraction > 0.7:
             reward -= (sla_fraction - 0.7) * 0.10
+
+        reward -= STEP_COST
 
         return max(-1.0, min(2.0, reward))
 
