@@ -46,8 +46,15 @@ from server.tasks import TASK_CONFIGS
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "openai/gpt-4o-mini")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
-ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860")
+ENV_URL: str = os.environ.get("ENV_URL", "")
 USE_TRAINED_MODEL: bool = os.environ.get("USE_TRAINED_MODEL", "1") == "1"
+
+# Direct in-process env calls — no HTTP server needed.
+# True by default: only falls back to HTTP when ENV_URL is explicitly set.
+USE_LOCAL_ENV: bool = (
+    os.environ.get("USE_LOCAL_ENV", "1") == "1"
+    or not ENV_URL
+)
 
 # Trained LoRA model id on Hugging Face (required when USE_TRAINED_MODEL=1)
 MODEL_ID: str | None = os.environ.get("MODEL_ID")

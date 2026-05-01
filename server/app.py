@@ -369,10 +369,7 @@ def _build_gradio_ui():
         )
         return transcript + footer
 
-    with gr.Blocks(
-        title="IncidentIQ — RL Agent Demo",
-        theme=gr.themes.Soft(primary_hue="indigo"),
-    ) as demo:
+    with gr.Blocks(title="IncidentIQ — RL Agent Demo") as demo:
         gr.Markdown(
             """
             # 🚨 IncidentIQ — Incident Response RL Agent
@@ -397,7 +394,6 @@ def _build_gradio_ui():
             lines=30,
             max_lines=60,
             interactive=False,
-            show_copy_button=True,
         )
 
         run_btn.click(
