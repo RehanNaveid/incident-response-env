@@ -342,7 +342,8 @@ def parse_output(
                 pass
 
     if not parsed:
-        return fallback, "", uniform, False      # parse_ok=False
+        reasoning = f"Thought: Fallback due to parse failure\nBelief: {json.dumps(uniform)}"
+        return fallback, reasoning, uniform, False      # parse_ok=False
 
     thought = str(parsed.get("thought", "")).strip()
     action  = str(parsed.get("action",  "")).strip() or fallback
@@ -407,21 +408,45 @@ def run_episode(model, tokenizer, task: str, seed: int,
             "action_history": action_history, "prompt": prompt,
         })
 
-        try:
-            raw = generate(model, tokenizer, prompt)
-        except Exception as e:
-            print(f"  [EP] generate failed step {step_num}: {e}")
-            break
-
+        # Derive service/candidate lists from current observation (stable across retries)
         affected = obs.get("affected_services", [])
         belief_candidates = (
             obs.get("fan_in_candidates")
             or obs.get("hypotheses")
             or affected
         )
-        action, reasoning, belief, parse_ok = parse_output(
-            raw, affected, belief_candidates
-        )
+
+        # --- Retry loop: up to _MAX_GEN_RETRIES attempts for valid JSON ---
+        _MAX_GEN_RETRIES = 2
+        raw         = ""
+        action      = f"investigate {(affected or ['auth-service'])[0]}"
+        reasoning   = ""
+        belief      = {}
+        parse_ok    = False
+
+        for _attempt in range(_MAX_GEN_RETRIES + 1):
+            _prompt_used = (
+                prompt
+                if _attempt == 0
+                else prompt + "\nREMEMBER: Output ONLY valid JSON with keys: thought, belief, action."
+            )
+            try:
+                raw = generate(model, tokenizer, _prompt_used)
+            except Exception as e:
+                print(f"  [EP] generate failed step={step_num} attempt={_attempt}: {e}")
+                break   # fall through to fallback action
+
+            action, reasoning, belief, parse_ok = parse_output(
+                raw, affected, belief_candidates
+            )
+            if parse_ok:
+                break   # valid JSON — proceed
+
+            if _attempt < _MAX_GEN_RETRIES:
+                print(f"  [EP] parse fail step={step_num} attempt={_attempt} — retrying")
+            else:
+                print(f"  [EP] parse fail step={step_num} — using fallback action={action!r}")
+
         debug_log(
             f"step task={task} seed={seed} rollout={rollout_idx} "
             f"t={step_num}/{max_steps} candidates={belief_candidates} "
@@ -677,17 +702,29 @@ def trainer_step(model, tokenizer, optimizer,
     finally:
         FastLanguageModel.for_training(model)
 
-    # ---- Parse-rate guard ----
+    # ---- Parse-rate guard (warn only — never crash training) ----
     avg_parse = sum(ep.parse_rate for ep in episodes) / max(len(episodes), 1)
     if avg_parse < _MIN_PARSE_RATE:
-        raise RuntimeError(
-            f"[TRAIN] HALT: parse_rate={avg_parse:.1%} < threshold {_MIN_PARSE_RATE:.0%}.\n"
-            f"  Model is producing garbage JSON. Possible causes:\n"
-            f"  - TEMPERATURE too high (try 0.7)\n"
-            f"  - prompt format mismatch\n"
-            f"  - model not following instruction format yet (wait 50+ steps)\n"
-            f"  Run dry_run() to diagnose without updating weights."
+        print(
+            f"[WARN] Low parse_rate={avg_parse:.1%} (threshold {_MIN_PARSE_RATE:.0%}) — "
+            f"JSON quality is poor but training continues.  "
+            f"Consider lowering TEMPERATURE or checking prompt format."
         )
+
+    # ---- Filter garbage rollouts (parse_rate ≤ 0.3 = pure noise for GRPO) ----
+    valid_episodes = [ep for ep in episodes if ep.parse_rate > 0.30]
+    if not valid_episodes:
+        print("[WARN] All rollouts had parse_rate ≤ 30% — skipping gradient step.")
+        return {
+            "loss": 0.0, "avg_reward": 0.0, "avg_r2": 0.0,
+            "avg_blended": 0.0, "avg_steps": 0.0,
+            "max_steps_ep": max_steps, "reward_std": 0.0,
+            "parse_rate": avg_parse, "sample": "N/A",
+        }
+    if len(valid_episodes) < len(episodes):
+        dropped = len(episodes) - len(valid_episodes)
+        print(f"[WARN] Dropped {dropped}/{len(episodes)} rollout(s) with parse_rate ≤ 30%.")
+    episodes = valid_episodes
 
     # blended_reward already set per-episode above (using raw_r1)
 
@@ -805,7 +842,7 @@ def train(model, tokenizer) -> None:
     print(f"[TRAIN] Done. Model at ./{FINAL_DIR}")
 
     # ---- Push to Hugging Face Hub ----
-    import os
+
     from huggingface_hub import login, HfApi
 
     hf_token = os.environ.get("HF_TOKEN")

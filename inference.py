@@ -84,31 +84,61 @@ MAX_STEPS = {
 _model = None
 _tokenizer = None
 
+# Default 4-bit base model — the LoRA adapter sits on top of this.
+_BASE_MODEL = "unsloth/qwen2.5-7b-instruct-unsloth-bnb-4bit"
+
 
 def get_model():
+    """Load the base model + LoRA adapter in HF-safe fashion.
+
+    Strategy:
+      1. Load the 4-bit quantised base model with Unsloth
+      2. Load the LoRA adapter separately (no merge — avoids OOM on HF GPU)
+      3. Switch to inference mode via FastLanguageModel.for_inference
+
+    MODEL_ID must point to a HF repo containing LoRA adapter weights
+    (adapter_config.json + adapter_model.safetensors).
+    """
     global _model, _tokenizer
+
     if _model is None:
         if not MODEL_ID:
             raise ValueError(
                 "MODEL_ID not set. Set MODEL_ID to your pushed LoRA repo "
-                "(e.g. rehannaveid/incidentiq-lora) once training finishes."
+                "(e.g. rehannaveid/incidentiq-lora) once training finishes.\n"
+                "Run with USE_TRAINED_MODEL=0 to use the OpenAI-compatible API instead."
             )
+
         try:
             from unsloth import FastLanguageModel
         except Exception as e:
             raise RuntimeError(
-                "Failed to import `unsloth`. Install it, or run with USE_TRAINED_MODEL=0."
+                "Failed to import `unsloth`. Install it with: pip install unsloth"
             ) from e
 
-        print(f"[INFER] Loading {MODEL_ID} ...", flush=True)
+        try:
+            from peft import PeftModel
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to import `peft`. Install it with: pip install peft"
+            ) from e
+
+        print(f"[INFER] Loading base model {_BASE_MODEL} (4-bit) ...", flush=True)
         _model, _tokenizer = FastLanguageModel.from_pretrained(
-            model_name=MODEL_ID,
+            model_name=_BASE_MODEL,
             max_seq_length=2048,
             load_in_4bit=True,
-            dtype=None,
+            dtype=None,   # auto: bfloat16 on A100, float16 elsewhere
         )
+
+        print(f"[INFER] Loading LoRA adapter from {MODEL_ID} ...", flush=True)
+        _model = PeftModel.from_pretrained(_model, MODEL_ID)
+        # ❌ DO NOT merge — merge_and_unload() causes OOM on HF GPU instances
+        # _model = _model.merge_and_unload()
+
         FastLanguageModel.for_inference(_model)
         print("[INFER] Model ready.", flush=True)
+
     return _model, _tokenizer
 
 
@@ -871,155 +901,239 @@ def env_step(action: str, reasoning: str = "") -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def run_task(task_id: str, client=None, seed: int = FIXED_SEED) -> Dict[str, Any]:
-    max_steps      = MAX_STEPS.get(task_id, 10)
-    max_total_reward = MAX_TOTAL_REWARDS.get(task_id, 1.0)
-
+    max_steps        = MAX_STEPS.get(task_id, 10)
     active_model_name = (MODEL_ID or "MODEL_ID_UNSET") if USE_TRAINED_MODEL else MODEL_NAME
     log_start(task=task_id, model=active_model_name)
 
-    step_num   = 0
-    rewards: List[float] = []
-    action_history: List[str] = []
+    step_num        = 0
+    rewards: List[float]    = []
+    action_history: List[str]  = []
+    history:   List[Dict]   = []
     reasoning_texts: List[str] = []
     score   = 0.0
     success = False
     seed_meta: dict = {}
 
-    # Unique session so /incident-meta returns data for THIS task's reset
-    import uuid
-    session_id = str(uuid.uuid4())
-    session_headers = {"X-Session-Id": session_id}
-
     try:
-        # ---- Reset ----
-        try:
-            payload = {"task_id": task_id, "seed": seed}
-            resp = requests.post(
-                f"{ENV_URL}/reset", json=payload,
-                headers=session_headers, timeout=30,
-            )
-            resp.raise_for_status()
-            reset_resp = resp.json()
-        except Exception as exc:
-            log_step(step=0, action="reset", reward=0.0, done=True, error=str(exc))
-            return {"task_id": task_id, "success": False, "steps": 0,
-                    "score": 0.0, "rewards": []}
+        if USE_LOCAL_ENV:
+            # ----------------------------------------------------------------
+            # Direct-env path — no HTTP, no server needed
+            # ----------------------------------------------------------------
+            from models import IncidentAction as _IncidentAction
 
-        observation = reset_resp.get("observation", {})
-        # Fetch meta NOW — env has been reset for this session
-        seed_meta   = get_seed_meta(task_id, observation, session_id=session_id)
-        done        = reset_resp.get("done", False)
-        history: List[Dict] = []
-        last_belief_dict: Dict[str, float] = {}
-        last_action: str = ""
-
-        # ---- Step loop ----
-        while not done and step_num < max_steps:
-            step_num += 1
-            error: str | None = None
-
-            if USE_TRAINED_MODEL:
-                chosen_action, reasoning_text, belief = ask_llm_local(
-                    observation,
-                    action_history,
-                    last_belief_dict,
-                    last_action,
-                )
-                last_action = chosen_action
-                if belief:
-                    last_belief_dict = belief
-            else:
-                chosen_action, reasoning_text, raw_response = ask_llm_openai(
-                    client, observation, history, action_history,
-                )
-                last_action = chosen_action
-
-                # Parse belief from model's raw response for next-step injection
-                try:
-                    parsed_response = json.loads(raw_response) if raw_response else {}
-                    last_belief_dict = parsed_response.get("belief", last_belief_dict)
-                except Exception:
-                    pass  # keep last known belief
-
-            if not last_belief_dict:
-                print(f"[WARN] step={step_num} belief parse failed — R2=0 this step", flush=True)
-
-            history.append({"role": "assistant", "content": chosen_action})
-            action_history.append(chosen_action)
+            env = _get_local_env()
 
             try:
-                payload = {
-                    "action": {"action": chosen_action, "reasoning": reasoning_text}
-                }
+                obs_obj = env.reset(task_id=task_id, seed=seed)
+            except Exception as exc:
+                log_step(step=0, action="reset", reward=0.0, done=True, error=str(exc))
+                return {"task_id": task_id, "success": False, "steps": 0,
+                        "score": 0.0, "rewards": []}
+
+            observation = _obs_to_dict(obs_obj)
+            # Seed meta comes straight from env._incident_data — zero latency
+            seed_meta = {k: env._incident_data.get(k, "")
+                         for k in ("root_cause", "team", "correct_team",
+                                   "valid_mitigations", "root_cause_service",
+                                   "affected_services")}
+            done = obs_obj.done
+            last_belief_dict: Dict[str, float] = {}
+
+            while not done and step_num < max_steps:
+                step_num += 1
+                error: str | None = None
+
+                if USE_TRAINED_MODEL:
+                    chosen_action, reasoning_text, last_belief_dict = ask_llm_local(
+                        observation, action_history, history, last_belief_dict, ""
+                    )
+                else:
+                    chosen_action, reasoning_text, raw_response = ask_llm_openai(
+                        client, observation, history, action_history,
+                    )
+                    try:
+                        parsed_resp = json.loads(raw_response) if raw_response else {}
+                        last_belief_dict = parsed_resp.get("belief", last_belief_dict)
+                    except Exception:
+                        pass
+
+                if not last_belief_dict:
+                    print(f"[WARN] step={step_num} no belief — R2=0 this step", flush=True)
+
+                action_history.append(chosen_action)
+                try:
+                    history.append({"role": "assistant",
+                                    "content": json.dumps({"action": chosen_action,
+                                                           "thought": "", "belief": last_belief_dict})})
+                except Exception:
+                    history.append({"role": "assistant", "content": chosen_action})
+
+                try:
+                    obs_obj = env.step(_IncidentAction(action=chosen_action,
+                                                       reasoning=reasoning_text))
+                    observation = _obs_to_dict(obs_obj)
+                    done   = obs_obj.done
+                    reward = float(obs_obj.reward or 0.0)
+                    feedback = observation.get("feedback", "")
+                except Exception as exc:
+                    error  = str(exc)
+                    reward = 0.0
+                    done   = True
+                    feedback = ""
+
+                result_summary = f"RESULT OF YOUR LAST ACTION: {feedback} Reward={reward:.2f}."
+                if "Fix applied" in feedback:
+                    if "healthy" in feedback or "you may resolve" in feedback.lower():
+                        result_summary += " LIVE METRICS healthy — resolve next."
+                    else:
+                        result_summary += " Still degraded — re-apply mitigation."
+                elif "Cannot resolve" in feedback:
+                    result_summary += " Apply mitigation first."
+                elif "Team name not recognized" in feedback:
+                    result_summary += " Retry with exact team name from roster."
+                history.append({"role": "user", "content": result_summary})
+                if len(history) > 12:
+                    history = history[-12:]
+
+                rewards.append(reward)
+                log_step(step=step_num, action=chosen_action,
+                         reward=reward, done=done, error=error)
+                if reasoning_text:
+                    reasoning_texts.append(reasoning_text)
+                if done:
+                    break
+
+            # Grading — read R2 directly from env.state() (no HTTP)
+            task_config = TASK_CONFIGS.get(task_id, {})
+            grader = task_config.get("grader")
+            if grader:
+                r1_score = grader(action_history, seed_meta,
+                                  reasoning_texts=reasoning_texts)
+                r2_score = 0.0
+                if last_belief_dict:
+                    try:
+                        st = env.state()
+                        r2_score = float(
+                            (st.model_dump() if hasattr(st, "model_dump") else st.dict())
+                            .get("info", {}).get("r2_score", 0.0) or 0.0
+                        )
+                    except Exception:
+                        pass
+                score = max(0.0, min(1.0, R1_WEIGHT * r1_score + R2_WEIGHT * r2_score))
+                print(
+                    f"[GRADE] task={task_id} R1={r1_score:.4f} R2={r2_score:.4f} "
+                    f"score={score:.4f} beliefs={len(reasoning_texts)}/{step_num}",
+                    flush=True,
+                )
+            else:
+                score = float(observation.get("score", 0.0) or 0.0)
+
+        else:
+            # ----------------------------------------------------------------
+            # HTTP path — env runs as a separate server (HF Space or local)
+            # ----------------------------------------------------------------
+            import uuid
+            session_id = str(uuid.uuid4())
+            session_headers = {"X-Session-Id": session_id}
+
+            try:
                 resp = requests.post(
-                    f"{ENV_URL}/step", json=payload,
+                    f"{ENV_URL}/reset",
+                    json={"task_id": task_id, "seed": seed},
                     headers=session_headers, timeout=30,
                 )
                 resp.raise_for_status()
-                step_resp   = resp.json()
-                observation = step_resp.get("observation", {})
-                done        = step_resp.get("done", False)
-                reward      = float(step_resp.get("reward", 0.0) or 0.0)
-
-                feedback = observation.get("feedback", "")
-                result_summary = f"RESULT OF YOUR LAST ACTION: {feedback} Reward={reward:.2f}."
-                if "No matching keywords found" in feedback or "Mitigation failed" in feedback:
-                    result_summary += " The mitigation failed. Do not resolve."
-                elif "Fix applied" in feedback:
-                    if "healthy" in feedback:
-                        result_summary += " The mitigation succeeded and the affected services recovered. Resolve next."
-                    else:
-                        result_summary += " The mitigation succeeded, but the affected services are still degraded. Re-apply the same mitigation and do not resolve yet."
-                elif "Cannot resolve" in feedback:
-                    if "still degraded" in feedback:
-                        result_summary += " The services have not recovered yet. Keep watching LIVE METRICS."
-                    else:
-                        result_summary += " A valid mitigation has not been applied yet."
-                elif "Team name not recognized" in feedback:
-                    result_summary += " Retry with an exact team name from the roster."
-                history.append({"role": "user", "content": result_summary})
-
+                reset_resp = resp.json()
             except Exception as exc:
-                error  = str(exc)
-                reward = 0.0
-                done   = True
+                log_step(step=0, action="reset", reward=0.0, done=True, error=str(exc))
+                return {"task_id": task_id, "success": False, "steps": 0,
+                        "score": 0.0, "rewards": []}
 
-            rewards.append(reward)
-            log_step(step=step_num, action=chosen_action,
-                     reward=reward, done=done, error=error)
-            if reasoning_text:
-                reasoning_texts.append(reasoning_text)
-            if done:
-                break
+            observation = reset_resp.get("observation", {})
+            seed_meta   = get_seed_meta(task_id, observation, session_id=session_id)
+            done        = reset_resp.get("done", False)
+            last_belief_dict: Dict[str, float] = {}
 
-        # ---- Grading (Phase 2: R1 * 0.60 + R2 * 0.40) ----
-        task_config = TASK_CONFIGS.get(task_id, {})
-        grader      = task_config.get("grader")
+            while not done and step_num < max_steps:
+                step_num += 1
+                error: str | None = None
 
-        if grader:
-            # R1 — task accuracy from keyword / structural grader
-            r1_score = grader(
-                action_history, seed_meta, reasoning_texts=reasoning_texts
-            )
+                if USE_TRAINED_MODEL:
+                    chosen_action, reasoning_text, last_belief_dict = ask_llm_local(
+                        observation, action_history, history, last_belief_dict, ""
+                    )
+                else:
+                    chosen_action, reasoning_text, raw_response = ask_llm_openai(
+                        client, observation, history, action_history,
+                    )
+                    try:
+                        parsed_resp = json.loads(raw_response) if raw_response else {}
+                        last_belief_dict = parsed_resp.get("belief", last_belief_dict)
+                    except Exception:
+                        pass
 
-            # R2 — belief calibration: −Σ p(s) log p̂(s), fetched from /state
-            # Zero-scores steps where belief was missing (no rollout drop)
-            r2_score = _fetch_episode_r2(session_headers)
-            if not last_belief_dict:
-                # Agent never output a belief — R2 stays 0 (already is)
-                r2_score = 0.0
+                if not last_belief_dict:
+                    print(f"[WARN] step={step_num} no belief — R2=0", flush=True)
 
-            score = max(0.0, min(1.0, R1_WEIGHT * r1_score + R2_WEIGHT * r2_score))
+                action_history.append(chosen_action)
+                history.append({"role": "assistant", "content": chosen_action})
 
-            print(
-                f"[GRADE] task={task_id} R1(task)={r1_score:.4f} "
-                f"R2(belief)={r2_score:.4f} "
-                f"score={score:.4f} "
-                f"beliefs_reported={len(reasoning_texts)}/{step_num}",
-                flush=True,
-            )
-        else:
-            score = float(observation.get("score", 0.0) or 0.0)
+                try:
+                    resp = requests.post(
+                        f"{ENV_URL}/step",
+                        json={"action": {"action": chosen_action, "reasoning": reasoning_text}},
+                        headers=session_headers, timeout=30,
+                    )
+                    resp.raise_for_status()
+                    step_resp   = resp.json()
+                    observation = step_resp.get("observation", {})
+                    done   = step_resp.get("done", False)
+                    reward = float(step_resp.get("reward", 0.0) or 0.0)
+                    feedback = observation.get("feedback", "")
+                    result_summary = f"RESULT OF YOUR LAST ACTION: {feedback} Reward={reward:.2f}."
+                    if "Fix applied" in feedback:
+                        result_summary += (" LIVE METRICS healthy — resolve next."
+                                           if "healthy" in feedback
+                                           else " Still degraded — re-apply mitigation.")
+                    elif "Cannot resolve" in feedback:
+                        result_summary += " Apply mitigation first."
+                    elif "Team name not recognized" in feedback:
+                        result_summary += " Retry with exact team name from roster."
+                    history.append({"role": "user", "content": result_summary})
+                except Exception as exc:
+                    error  = str(exc)
+                    reward = 0.0
+                    done   = True
+
+                rewards.append(reward)
+                log_step(step=step_num, action=chosen_action,
+                         reward=reward, done=done, error=error)
+                if reasoning_text:
+                    reasoning_texts.append(reasoning_text)
+                if done:
+                    break
+
+            task_config = TASK_CONFIGS.get(task_id, {})
+            grader = task_config.get("grader")
+            if grader:
+                r1_score = grader(action_history, seed_meta,
+                                  reasoning_texts=reasoning_texts)
+                r2_score = _fetch_episode_r2(session_headers)
+                if not last_belief_dict:
+                    r2_score = 0.0
+                score = max(0.0, min(1.0, R1_WEIGHT * r1_score + R2_WEIGHT * r2_score))
+                print(
+                    f"[GRADE] task={task_id} R1={r1_score:.4f} R2={r2_score:.4f} "
+                    f"score={score:.4f} beliefs={len(reasoning_texts)}/{step_num}",
+                    flush=True,
+                )
+            else:
+                score = float(observation.get("score", 0.0) or 0.0)
+
+            try:
+                requests.delete(f"{ENV_URL}/session", headers=session_headers, timeout=5)
+            except Exception:
+                pass
 
         score   = max(0.0, min(score, 1.0))
         success = score >= 0.5
@@ -1030,14 +1144,6 @@ def run_task(task_id: str, client=None, seed: int = FIXED_SEED) -> Dict[str, Any
 
     finally:
         log_end(success=success, steps=step_num, score=score, rewards=rewards)
-        try:
-            requests.delete(
-                f"{ENV_URL}/session",
-                headers=session_headers,
-                timeout=5,
-            )
-        except Exception:
-            pass
 
     return {"task_id": task_id, "success": success, "steps": step_num,
             "score": score, "rewards": rewards}

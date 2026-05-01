@@ -303,5 +303,122 @@ def main() -> None:
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
+# ===================================================================
+# Gradio UI  (Option C — UI button demo)
+# ===================================================================
+
+def _build_gradio_ui():
+    """Build and return the Gradio Blocks interface.
+
+    Mounted at /ui so the FastAPI REST endpoints remain available
+    at their existing paths (/reset, /step, /state …).
+
+    The agent loop calls inference.run_task() directly (USE_LOCAL_ENV mode)
+    and yields one line at a time so the textbox updates live.
+    """
+    try:
+        import gradio as gr
+    except ImportError:
+        return None   # Gradio not installed — skip UI gracefully
+
+    import sys, io, threading, queue as _queue
+
+    TASK_CHOICES = [
+        ("🔴 Single service outage",         "single_service_outage"),
+        ("🟠 Cascading failure",              "cascading_failure"),
+        ("🟡 Ambiguous payment degradation",  "ambiguous_payment_degradation"),
+    ]
+
+    def _run_agent(task_label: str, seed: int) -> str:
+        """Run one episode and return the full transcript as a string."""
+        # Map display label → task_id
+        task_id = next(
+            (tid for lbl, tid in TASK_CHOICES if lbl == task_label),
+            "single_service_outage",
+        )
+
+        # Capture stdout (log_start / log_step / log_end / [GRADE] lines)
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+
+        try:
+            import inference as _inf
+            # Force local-env mode for the UI — no HTTP server required
+            _inf.USE_LOCAL_ENV = True
+            result = _inf.run_task(task_id=task_id, seed=int(seed))
+        except Exception as exc:
+            import traceback
+            buf.write(f"\n[ERROR] {exc}\n")
+            traceback.print_exc(file=buf)
+            result = {}
+        finally:
+            sys.stdout = old_stdout
+
+        transcript = buf.getvalue()
+
+        # Append a visual summary footer
+        score   = result.get("score",   0.0)
+        steps   = result.get("steps",   0)
+        success = result.get("success", False)
+        status  = "✅ RESOLVED" if success else "❌ NOT RESOLVED"
+        footer = (
+            f"\n{'─' * 60}\n"
+            f"  {status}   score={score:.3f}   steps={steps}\n"
+            f"{'─' * 60}"
+        )
+        return transcript + footer
+
+    with gr.Blocks(
+        title="IncidentIQ — RL Agent Demo",
+        theme=gr.themes.Soft(primary_hue="indigo"),
+    ) as demo:
+        gr.Markdown(
+            """
+            # 🚨 IncidentIQ — Incident Response RL Agent
+            Select a scenario and click **Run Agent** to watch the trained LoRA model
+            investigate, mitigate, and resolve the incident in real time.
+            """
+        )
+
+        with gr.Row():
+            task_dd = gr.Dropdown(
+                choices=[lbl for lbl, _ in TASK_CHOICES],
+                value=TASK_CHOICES[0][0],
+                label="Incident Scenario",
+            )
+            seed_nb = gr.Number(value=42, label="Seed", precision=0, minimum=0)
+
+        run_btn  = gr.Button("▶ Run Agent", variant="primary")
+        clear_btn = gr.Button("🗑 Clear", variant="secondary")
+
+        output_box = gr.Textbox(
+            label="Agent Transcript",
+            lines=30,
+            max_lines=60,
+            interactive=False,
+            show_copy_button=True,
+        )
+
+        run_btn.click(
+            fn=_run_agent,
+            inputs=[task_dd, seed_nb],
+            outputs=output_box,
+        )
+        clear_btn.click(fn=lambda: "", outputs=output_box)
+
+    return demo
+
+
+# Mount Gradio at /ui  (coexists with the FastAPI REST API)
+_gradio_ui = _build_gradio_ui()
+if _gradio_ui is not None:
+    try:
+        import gradio as gr
+        app = gr.mount_gradio_app(app, _gradio_ui, path="/ui")
+    except Exception as _e:
+        print(f"[WARN] Gradio UI mount failed: {_e}", flush=True)
+
+
 if __name__ == "__main__":
     main()

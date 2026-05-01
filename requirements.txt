@@ -5,3 +5,14 @@ uvicorn>=0.24.0
 requests>=2.25.0
 openai>=1.0.0
 python-dotenv>=1.0.0
+python-multipart>=0.0.9
+
+# Gradio UI
+gradio>=4.0.0
+
+# LoRA inference (HF Space GPU)
+unsloth
+peft>=0.10.0
+bitsandbytes>=0.43.0
+accelerate>=0.29.0
+torch>=2.1.0
