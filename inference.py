@@ -39,6 +39,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from server.tasks import TASK_CONFIGS
 
 
+_local_env = None
+
+def _get_local_env():
+    global _local_env
+    if _local_env is None:
+        from server.env import IncidentResponseEnv
+        _local_env = IncidentResponseEnv()
+    return _local_env
+
+
+def _obs_to_dict(obs):
+    if hasattr(obs, "model_dump"):
+        return obs.model_dump()
+    if hasattr(obs, "dict"):
+        return obs.dict()
+    return obs.__dict__
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
