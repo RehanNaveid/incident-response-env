@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from models import IncidentAction, IncidentObservation, ResetRequest, StepRequest
 from server.environment import IncidentResponseEnv
 from server.tasks import TASK_CONFIGS
+from inference import main as _agent_main
 
 
 # ===================================================================
@@ -97,6 +98,25 @@ app = create_fastapi_app(lambda: _env, IncidentAction, IncidentObservation)
 # a ResponseValidationError 500.  Our @app.get("/state") below calls env.state()
 # correctly and returns s.model_dump().
 app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/state"]
+
+
+# ===================================================================
+# Startup — run agent loop in background thread
+# ===================================================================
+
+@app.on_event("startup")
+def run_agent() -> None:
+    """Launch the RL agent loop once the server is ready.
+
+    Runs in a daemon thread so the HTTP server (REST endpoints + Gradio UI)
+    stays responsive while the agent executes — which can take several minutes
+    per episode.  Daemon=True means the thread is killed automatically when the
+    main process exits (no zombie threads on HF Space restart).
+    """
+    print("[APP] Starting agent...", flush=True)
+    t = threading.Thread(target=_agent_main, daemon=True, name="agent-loop")
+    t.start()
+    print("[APP] Agent thread launched.", flush=True)
 
 
 # ===================================================================
