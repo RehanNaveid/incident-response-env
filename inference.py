@@ -21,10 +21,15 @@ Log format:
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
+
+# Ensure the project root is on sys.path regardless of where the script is
+# invoked from (required on HF Space where CWD may not be the repo root).
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+import json
+import re
 from typing import Any, Dict, List, Tuple
 # from dotenv import load_dotenv
 import requests
