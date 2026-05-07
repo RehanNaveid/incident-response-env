@@ -1,60 +1,225 @@
----
-title: IncidentIQ
-emoji: 🤖
-colorFrom: blue
-colorTo: green
-sdk: docker
-sdk_version: "latest"
-python_version: "3.12"
-app_file: app.py
-pinned: false
----
-
-# IncidentIQ — SRE Incident Response Environment
+# IncidentIQ — Causal Inference for Distributed System Failures
 
 [![OpenEnv](https://img.shields.io/badge/OpenEnv-compliant-brightgreen)](https://openenv.dev)
-[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace%20Space-yellow)](https://huggingface.co)
+[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace%20Space-yellow)](https://huggingface.co/spaces/RehanNaveid/incident-response-env)
 [![Docker](https://img.shields.io/badge/Docker-ready-blue)](https://www.docker.com)
+[![Model](https://img.shields.io/badge/LoRA-rehannaveid%2Fincidentiq--lora-orange)](https://huggingface.co/rehannaveid/incidentiq-lora)
 
-## Description and Motivation
+> An RL-trained LLM agent that identifies true root causes in multi-service outages through sequential hypothesis testing under uncertainty — not keyword matching. The agent builds its own belief distribution from raw, noisy signals across a deceptive causal graph.
 
-Site Reliability Engineers respond to production incidents under time pressure, working from incomplete information — logs, metrics, and service dependencies — to diagnose root causes and apply targeted fixes before SLA windows expire. This is a structured reasoning task that real engineers perform daily, and one where AI agents are increasingly expected to assist.
+**POMDP world modeling · GRPO + Unsloth · Causal DAG · Multi-reward RL**
+---
 
-**IncidentIQ** simulates this task as a reinforcement learning environment. An agent receives live system telemetry, must reason about root causes from log evidence, and execute a correct sequence of actions to resolve the incident. The environment models real failure patterns:
+## Live Links
 
-- Connection pool exhaustion
-- Cascading config deploys
-- Memory leaks
-- Certificate expiry
-- Upstream rate limiting
-- Database degradation
+- Live Environment Demo:
+  https://huggingface.co/spaces/RehanNaveid/incident-response-env
 
-Training agents on this environment develops capabilities in structured diagnostic reasoning, evidence-based decision making, and sequential planning under constraints — skills that transfer directly to real SRE automation.
+- Trained LoRA Model:
+  https://huggingface.co/RehanNaveid/incidentiq-lora
+
 
 ---
 
-## Action Space
+## Why RL? The gap that makes it necessary
 
-Actions are **free-text commands**. The environment parses intent from the text.
+A prompted GPT-4o-mini solves the old version (visible root cause in logs) with a 0.93 score — zero RL needed. The new version hides the root cause inside a latent causal DAG with deceptive signals. No static prompt can solve a POMDP that changes every episode.
+
+| Version | Setup | Baseline score | RL needed? |
+|---|---|---|---|
+| Old | Root cause visible in logs — agent reads error → keyword match → fix | **0.93** | No |
+| New | Root cause hidden in latent causal DAG — agent infers structure from ambiguous logs | **~0.25** | Yes |
+
+The gap from 0.25 to 0.85+ is exactly what GRPO trains into.
+
+---
+
+## What makes this environment hard
+
+Four properties together make reasoning unavoidable — not just "more nodes":
+
+**Fan-in ambiguity** — `api-gateway` failure has 3 possible upstream causes: `auth-service`, `db-service`, `cache-service`. Root is not obvious from any single observation. Agent must disambiguate.
+
+**Red herrings** — `user-service` logs show errors but is perfectly healthy. Observation ≠ truth. Agent must learn to distrust surface-level signals.
+
+**Temporal delay** — `db-service` fails at t=0, api fails at t=2, user fails at t=3. Symptoms appear disconnected from cause.
+
+**Observation noise** — Fake latency spikes, intermittent failures, misleading log lines. Agent must filter signal from noise across multiple investigation steps.
+
+---
+
+## Reward design
+
+Rewards are **dense and continuous** across the full episode, with four independent graders:
+
+| Reward | Weight | What it measures |
+|---|---|---|
+| R1 — root cause accuracy | 0.60 | Did the agent mitigate the actual root node? Penalty if symptom node mitigated. |
+| R2 — belief calibration | 0.40 | Rewards inference trajectory quality. Root probability must increase over steps. Final belief must rank root highest. |
+
+`final_score = R1 × 0.60 + R2 × 0.40`
+
+| Action | Reward |
+|---|---|
+| Investigate correct service | `+0.15` to `+0.23` |
+| Assign correct team | `+0.10` |
+| Apply correct mitigation keywords | `+0.20` to `+0.52` |
+| Mitigate without investigating first | `−0.25` |
+| Resolve before mitigation confirmed | `−0.40` |
+| Repeated identical action | `−0.20` |
+
+---
+
+## Trained model results
+
+Model: `rehannaveid/incidentiq-lora` (Qwen2.5-7B-Instruct + LoRA, trained with GRPO via Unsloth), `seed=42`.
+
+| Task | Difficulty | Steps | R1 | R2 | Score | Success |
+|---|---|---|---|---|---|---|
+| `single_service_outage` | Easy | 11 | 0.90 | 0.67 | **0.81** | ✅ |
+| `cascading_failure` | Medium | 18 | 0.41 | 0.62 | **0.49** | ✅ |
+| `ambiguous_payment_degradation` | Hard | 9 | 0.70 | 0.27 | **0.53** | ✅ |
+| **Average** | | **12.7** | **0.67** | **0.52** | **0.61** | **3/3** |
+
+
+![image](https://cdn-uploads.huggingface.co/production/uploads/69d5e7a8bd2bdf61c0d49700/bAEH80ZiS8HVCmDjYTmG4.png)
+
+
+![image](https://cdn-uploads.huggingface.co/production/uploads/69d5e7a8bd2bdf61c0d49700/KhSTgZ4RYaWPalnqwGkGn.png)
+
+<details>
+<summary>Full inference log</summary>
+
+```
+[START] task=single_service_outage env=incident_response_env model=rehannaveid/incidentiq-lora
+[STEP] step=1  action=investigate payment-service              reward=0.48  done=false error=null
+[STEP] step=2  action=assign to dev-team                       reward=0.25  done=false error=null
+[STEP] step=3  action=mitigate: restart service                reward=0.84  done=false error=null
+[STEP] step=4  action=mitigate: scale_up                       reward=0.24  done=false error=null
+[STEP] step=5  action=investigate stripe-api                   reward=0.07  done=false error=null
+[STEP] step=6  action=resolve                                  reward=-0.35 done=false error=null
+[STEP] step=7  action=investigate: payment-service             reward=-0.22 done=false error=null
+[STEP] step=8  action=assign to backend-team                   reward=0.16  done=false error=null
+[STEP] step=9  action=resolve                                  reward=-0.53 done=false error=null
+[STEP] step=10 action=resolve                                  reward=-0.49 done=false error=null
+[STEP] step=11 action=resolve                                  reward=-0.54 done=true  error=null
+[GRADE] task=single_service_outage R1=0.9000 R2=0.6742 score=0.8097
+[END] success=true steps=11 score=0.81
+
+[START] task=cascading_failure env=incident_response_env model=rehannaveid/incidentiq-lora
+[STEP] step=1  action=investigate cache-cluster                reward=0.41  done=false error=null
+[STEP] step=2  action=investigate auth-service                 reward=0.48  done=false error=null
+[STEP] step=3  action=assign to database                       reward=0.29  done=false error=null
+[STEP] step=4  action=investigate api-gateway                  reward=0.34  done=false error=null
+[STEP] step=5  action=mitigate: restart payment-service db     reward=0.21  done=false error=null
+[STEP] step=6  action=resolve                                  reward=-0.04 done=false error=null
+[STEP] step=7  action=investigate user-service                 reward=0.09  done=false error=null
+[STEP] step=8-18 action=resolve (repeated)                     reward<0     done=true  error=null
+[GRADE] task=cascading_failure R1=0.4100 R2=0.6180 score=0.4932
+[END] success=true steps=18 score=0.49
+
+[START] task=ambiguous_payment_degradation env=incident_response_env model=rehannaveid/incidentiq-lora
+[STEP] step=1  action=investigate payment-service              reward=0.47  done=false error=null
+[STEP] step=2  action=assign to database                       reward=0.23  done=false error=null
+[STEP] step=3  action=investigate: memory_leak                 reward=0.17  done=false error=null
+[STEP] step=4  action=investigate rate_limit                   reward=0.04  done=false error=null
+[STEP] step=5  action=assign to backend-team                   reward=-0.15 done=false error=null
+[STEP] step=6  action=mitigate: restart service                reward=0.41  done=false error=null
+[STEP] step=7  action=resolve                                  reward=-0.35 done=false error=null
+[STEP] step=8  action=resolve                                  reward=-0.95 done=false error=null
+[STEP] step=9  action=resolve                                  reward=-0.86 done=true  error=null
+[GRADE] task=ambiguous_payment_degradation R1=0.7000 R2=0.2661 score=0.5264
+[END] success=true steps=9 score=0.53
+```
+
+</details>
+
+---
+
+## GPT-4o-mini baseline (old environment)
+
+Run with `seed=42`, model `openai/gpt-4o-mini`, original environment (root cause visible in logs).
+
+| Task | Steps | Score |
+|---|---|---|
+| `single_service_outage` | 7 | **0.85** |
+| `cascading_failure` | 7 | **0.96** |
+| `ambiguous_payment_degradation` | 10 | **0.99** |
+| **Average** | **8.0** | **0.93** |
+
+This score is why RL is justified — the old environment was already solved. The new deceptive environment drops the untrained baseline to ~0.25.
+
+---
+
+## Belief architecture
+
+The critical design choice: belief must be **constructed by the agent**, not pre-computed by the environment.
+
+**Wrong — privileged state:**
+```json
+{ "logs": [...], "belief": {"auth": 0.6, "api": 0.3} }
+```
+Environment precomputes the hard part. R2 becomes tautological. Not a real POMDP.
+
+**Correct — latent cognition:**
+```json
+{ "logs": [...], "metrics": [...], "prev_actions": [...] }
+```
+Agent outputs `Thought → Belief → Action`. Belief is the agent's learned inference. R2 rewards quality of the inference trajectory.
+
+Required output format (for GRPO parseability):
+```json
+{
+  "thought": "auth latency increasing → possible upstream issue",
+  "belief": {"auth": 0.7, "api": 0.2, "db": 0.1},
+  "action": "investigate auth-service"
+}
+```
+
+Parse failures assign R2=0 but keep the rollout in the batch — R1/R3/R4 still contribute.
+
+---
+
+## GRPO training loop
+
+1. **Observation** — agent sees raw logs, metrics, timestamps, previous actions. No belief. No hints about root cause.
+2. **6–8 rollouts** — same prompt, different action sequences. Variance is essential for GRPO.
+3. **Score each** — R1–R2 grade every trajectory. Root hit = high reward. Symptom fix = penalty.
+4. **Gradient update** — TRL pushes weights toward above-average rollouts. Unsloth: 2× faster, 60% less memory via 4-bit QLoRA.
+
+---
+
+## Tasks
+
+### Task 1 — Single Service Outage *(Easy, max 12 steps)*
+
+One service is down with a clear root cause visible in the logs. The agent must investigate the affected service, assign the correct team, apply the matching mitigation keyword from the error log, and resolve. A capable agent should complete this in 4–5 steps.
+
+### Task 2 — Cascading Failure *(Medium, max 18 steps)*
+
+Three services fail in sequence after a config deploy. The agent must investigate all three, identify the root cause service, apply the correct rollback, and resolve before a tight SLA expires. Requires systematic investigation before mitigation.
+
+### Task 3 — Ambiguous Payment Degradation *(Hard, max 25 steps)*
+
+The payment service degrades with three plausible root causes and two deliberate red herrings in the logs. The agent must investigate multiple hypothesis domains (upstream rate limiting, database issues, resource exhaustion), identify the real cause, and apply the correct mitigation. The `reasoning` field in actions is evaluated for partial credit — the only task that rewards chain-of-thought, not just actions.
+
+---
+
+## Action space
 
 | Format | Description |
 |---|---|
-| `investigate <service>` | Examine a specific service. Service name must match **AFFECTED SERVICES** exactly. |
-| `assign to <team>` | Assign the incident to a team. Team name must match **TEAM ROSTER** exactly. |
-| `mitigate: <fix>` | Apply a targeted fix. The fix keyword must appear in the `ERROR` or `CRIT` logs. |
+| `investigate <service>` | Examine a specific service. Must match **AFFECTED SERVICES** exactly. |
+| `assign to <team>` | Assign the incident to a team. Must match **TEAM ROSTER** exactly. |
+| `mitigate: <fix>` | Apply a targeted fix. The fix keyword must appear in `ERROR` or `CRIT` logs. |
 | `escalate` | Escalate the incident severity. |
 | `resolve` | Close the incident. Only valid after a confirmed mitigation. |
 
-**Enforcement rules:**
-- Mitigation requires prior investigation of at least one affected service.
-- Resolve requires a confirmed mitigation.
-- Repeated identical actions incur penalties.
+Enforcement rules: mitigation requires prior investigation; resolve requires confirmed mitigation; repeated identical actions incur penalties.
 
 ---
 
-## Observation Space
-
-Each `step()` call returns an `IncidentObservation` object with these fields:
+## Observation space
 
 | Field | Type | Description |
 |---|---|---|
@@ -72,131 +237,42 @@ Each `step()` call returns an `IncidentObservation` object with these fields:
 
 ---
 
-## Tasks
-
-### Task 1 — Single Service Outage *(Easy, max 10 steps)*
-
-One service is down with a clear root cause visible in the logs. The agent must investigate the affected service, assign the correct team, apply the matching mitigation keyword from the error log, and resolve. A capable agent should complete this in 4–5 steps.
-
-### Task 2 — Cascading Failure *(Medium, max 18 steps)*
-
-Three services fail in sequence after a config deploy. The agent must investigate all three, identify the root cause service, apply the correct rollback, and resolve before a tight SLA expires. Requires systematic investigation before mitigation.
-
-### Task 3 — Ambiguous Payment Degradation *(Hard, max 25 steps)*
-
-The payment service degrades with three plausible root causes and two deliberate red herrings in the logs. The agent must investigate multiple hypothesis domains (upstream rate limiting, database issues, resource exhaustion), identify the real cause, and apply the correct mitigation. The optional `reasoning` field in actions is evaluated for partial credit, making this the only task that rewards chain-of-thought, not just actions.
-
----
-
-## Reward Design
-
-Rewards are **dense and continuous** across the full episode:
-
-| Action | Reward |
-|---|---|
-| Investigate correct service | `+0.15` to `+0.23` |
-| Assign correct team | `+0.10` |
-| Apply correct mitigation keywords | `+0.20` to `+0.52` |
-| Mitigate without investigating first | `−0.25` |
-| Resolve before mitigation confirmed | `−0.40` |
-| Repeated action | `−0.20` |
-| Unknown action | `−0.20` |
-| SLA breach (past 60% of window) | Graduated decay |
-
-Final episode score is computed by a **deterministic grader** applied to the full action history. Graders check investigation completeness, team assignment accuracy, mitigation keyword match, resolution, and efficiency. All scores are in `[0.0, 1.0]`.
-
----
-
-## Baseline Results
-
-Run with `seed=42`, model `openai/gpt-4o-mini`, no task-specific hints in prompt.
-
-| Task | Difficulty | Steps Used | Score |
-|---|---|---|---|
-| `single_service_outage` | Easy | 7 | **0.85** |
-| `cascading_failure` | Medium | 7 | **0.96** |
-| `ambiguous_payment_degradation` | Hard | 10 | **0.99** |
-| **Average** | | **8.0** | **0.93** |
-
-<details>
-<summary>Full inference log</summary>
-
-```
-[START] task=single_service_outage env=incident_response_env model=openai/gpt-4o-mini
-[STEP] step=1 action=investigate payment-service reward=0.25 done=false error=null
-[STEP] step=2 action=assign to payments-oncall reward=0.10 done=false error=null
-[STEP] step=3 action=mitigate: increase memory limit for payment-service pods reward=0.32 done=false error=null
-[STEP] step=4 action=mitigate: increase memory limit for payment-service pods reward=0.40 done=false error=null
-[STEP] step=5 action=mitigate: increase memory limit for payment-service pods reward=-0.26 done=false error=null
-[STEP] step=6 action=mitigate: increase memory limit for payment-service pods reward=-0.39 done=false error=null
-[STEP] step=7 action=resolve reward=0.30 done=true error=null
-[END] success=true steps=7 score=0.85 rewards=0.25,0.10,0.32,0.40,-0.26,-0.39,0.30
-
-[START] task=cascading_failure env=incident_response_env model=openai/gpt-4o-mini
-[STEP] step=1 action=investigate auth-service reward=0.25 done=false error=null
-[STEP] step=2 action=investigate api-gateway reward=0.22 done=false error=null
-[STEP] step=3 action=investigate user-service reward=0.19 done=false error=null
-[STEP] step=4 action=mitigate: rollback config token_verifier_v2 in auth-service reward=0.42 done=false error=null
-[STEP] step=5 action=mitigate: rollback config token_verifier_v2 in auth-service reward=0.42 done=false error=null
-[STEP] step=6 action=mitigate: rollback config token_verifier_v2 in auth-service reward=-0.26 done=false error=null
-[STEP] step=7 action=resolve reward=0.28 done=true error=null
-[END] success=true steps=7 score=0.96 rewards=0.25,0.22,0.19,0.42,0.42,-0.26,0.28
-
-[START] task=ambiguous_payment_degradation env=incident_response_env model=openai/gpt-4o-mini
-[STEP] step=1 action=investigate payment-service reward=-0.15 done=false error=null
-[STEP] step=2 action=investigate payment-service db connection reward=-0.68 done=false error=null
-[STEP] step=3 action=investigate payment-service rate limit reward=-0.46 done=false error=null
-[STEP] step=4 action=investigate payment-service memory heap reward=-0.34 done=false error=null
-[STEP] step=5 action=assign to payments-oncall reward=0.10 done=false error=null
-[STEP] step=6 action=mitigate: increase memory allocation for payment-service reward=0.52 done=false error=null
-[STEP] step=7 action=mitigate: increase memory allocation for payment-service reward=0.61 done=false error=null
-[STEP] step=8 action=mitigate: increase memory allocation for payment-service reward=-0.07 done=false error=null
-[STEP] step=9 action=mitigate: increase memory allocation for payment-service reward=-0.40 done=false error=null
-[STEP] step=10 action=resolve reward=0.30 done=true error=null
-[END] success=true steps=10 score=0.99 rewards=-0.15,-0.68,-0.46,-0.34,0.10,0.52,0.61,-0.07,-0.40,0.30
-
-[SUMMARY] tasks=3 avg_score=0.9308 total_steps=24 all_success=True
-  single_service_outage               [████████████████░░░░] 0.8460 (7 steps)
-  cascading_failure                   [███████████████████░] 0.9587 (7 steps)
-  ambiguous_payment_degradation       [███████████████████░] 0.9878 (10 steps)
-```
-
-</details>
-
----
-
-## Setup and Usage
+## Setup and usage
 
 ### Requirements
 
 ```bash
 pip install -r requirements.txt
+# or
+pip install -e .
 ```
 
-### Environment Variables
+### Environment variables
 
 ```bash
 export API_BASE_URL="https://your-llm-endpoint/v1"
 export MODEL_NAME="your-model-name"
 export HF_TOKEN="your-api-key"
-# For local testing
-export ENV_URL="http://localhost:7860"
-
-# For Hugging Face deployment (used by evaluator)
-export ENV_URL="https://<your-space-name>.hf.space" # default; only change if server runs elsewhere
+export ENV_URL="http://localhost:7860"   # only needed for HTTP mode
 ```
 
-### Running
+### Run with the trained LoRA model (requires GPU)
 
 ```bash
-# Terminal 1 — start the environment server
-python app.py
+USE_TRAINED_MODEL=1 MODEL_ID="rehannaveid/incidentiq-lora" python inference.py
+```
 
-# Terminal 2 — run the inference script
+### Run with an OpenAI-compatible API (no GPU needed)
+
+```bash
+USE_TRAINED_MODEL=0 \
+API_BASE_URL="https://openrouter.ai/api/v1" \
+MODEL_NAME="qwen/qwen2.5-7b-instruct" \
+HF_TOKEN="your-key" \
 python inference.py
 ```
 
-### Running a Single Task
+### Run a single task
 
 ```bash
 TASK_IDS_OVERRIDE=single_service_outage python inference.py
@@ -213,7 +289,7 @@ docker run -p 7860:7860 \
   incidentiq
 ```
 
-### Verifying the Environment
+### Verify the environment
 
 ```bash
 curl -s -X POST http://localhost:7860/reset \
@@ -224,21 +300,21 @@ curl -s -X POST http://localhost:7860/reset \
 
 ---
 
-## API Endpoints
+## API endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/reset` | POST | Start a new episode. Body: `{"task_id": "...", "seed": 42}` |
 | `/step` | POST | Send one action. Body: `{"action": {"action": "..."}}` |
-| `/state` | GET | Get current episode state including ground truth for grading |
-| `/incident-meta` | GET | Get incident metadata used by graders |
-| `/runbook` | GET | Get diagnostic hints for an affected service |
+| `/state` | GET | Current episode state including ground truth for grading |
+| `/incident-meta` | GET | Incident metadata used by graders |
+| `/runbook` | GET | Diagnostic hints for an affected service |
 | `/tasks` | GET | List all available tasks |
 | `/health` | GET | Server health check |
 
 ---
 
-## OpenEnv Compliance
+## OpenEnv compliance
 
 - Full `step()` / `reset()` / `state()` implementation
 - Typed Pydantic models for all actions and observations
@@ -249,41 +325,31 @@ curl -s -X POST http://localhost:7860/reset \
 
 ---
 
-## Project Structure
+## Project structure
+
 ```
 incident-response-env/
-├── server/                         # Core environment server (FastAPI + OpenEnv)
-│   ├── __init__.py
-│   ├── app.py                      # FastAPI app exposing /reset, /step, /state, /health
-│   ├── environment.py              # Main environment logic (step/reset/state, reward)
-│   ├── incidents.py                # Deterministic incident generator (seed-based)
-│   ├── simulator.py                # Dynamic simulation (logs + metrics evolution)
-│   ├── tasks.py                    # Task configs (difficulty, max_steps, rewards)
-│
-├── models.py                       # Pydantic models (Action, Observation, State)
-├── inference.py                    # Baseline agent (OpenAI-compatible client)
-├── client.py                       # Optional client helper for interacting with env
-│
-├── openenv.yaml                    # OpenEnv metadata (tasks, spaces, entrypoint)
-├── Dockerfile                      # Container setup for HF Spaces deployment
-├── pyproject.toml                  # Project config (used by uv)
-├── uv.lock                         # Dependency lock file (reproducible builds)
-├── requirements.txt                # Python dependencies (fallback install)
-│
-├── .env                            # Local environment variables (not committed)
-├── .env.example                    # Template for required env variables
-├── .gitignore                      # Ignore rules
-│
-├── validate-submission.sh          # Pre-submission validation script
-├── README.md                       # Project documentation
-│
-├── venv/ or .venv/                 # Virtual environment (local only, ignored)
-└── __pycache__/                    # Python cache (auto-generated)
+├── server/
+│   ├── app.py              # FastAPI app — /reset, /step, /state, /health
+│   ├── environment.py      # Step/reset/state logic, reward computation
+│   ├── incidents.py        # Deterministic incident generator (seed-based)
+│   ├── simulator.py        # Dynamic log + metrics evolution
+│   └── tasks.py            # Task configs (difficulty, max_steps, graders)
+├── models.py               # Pydantic models (Action, Observation, State)
+├── inference.py            # Agent loop (local LoRA or OpenAI-compatible API)
+├── utils.py                # format_stateful_prompt, generate, parse_output
+├── train.py                # GRPO training script (Unsloth + TRL)
+├── openenv.yaml            # OpenEnv metadata
+├── Dockerfile              # HF Spaces deployment
+├── requirements.txt        # Python dependencies
+└── README.md
 ```
----
 
-The inference script uses an OpenAI-compatible client interface configured via API_BASE_URL and MODEL_NAME.
+---
 
 ## License
 
 MIT
+avatar
+Ask In Chat
+Ask In Chat
