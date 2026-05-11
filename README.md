@@ -350,6 +350,4 @@ incident-response-env/
 ## License
 
 MIT
-avatar
-Ask In Chat
-Ask In Chat
+
